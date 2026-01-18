@@ -1,0 +1,51 @@
+# Build outputs
+cpp_realtime_ocr/build/
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# TensorRT engines (GPU-specific, should be rebuilt)
+*.engine
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+pip-log.txt
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# Debug/test images
+*.png
+*.jpg
+*.bmp
+debug_*/
+
+# Training outputs
+training/runs/
+training/labels/
+
+# Model weights (large files)
+*.pt
+*.onnx
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+

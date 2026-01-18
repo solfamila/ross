@@ -1,0 +1,131 @@
+{
+  "meta": {
+    "auto_roi": false,
+    "frame_size": [
+      1920,
+      1080
+    ],
+    "reselect_roi": [
+      "thinkorswim_or_bookmap_last_price"
+    ],
+    "reset_roi": false,
+    "roi_at": 5.0,
+    "video": "ross.mp4",
+    "video_fps": 30.0
+  },
+  "rois": [
+    {
+      "h": 21,
+      "name": "lightspeed_last_price",
+      "w": 41,
+      "x": 206,
+      "y": 469
+    },
+    {
+      "h": 816,
+      "name": "thinkorswim_or_bookmap_last_price",
+      "w": 82,
+      "x": 1539,
+      "y": 154
+    },
+    {
+      "h": 132,
+      "name": "lightspeed_orders_table",
+      "w": 186,
+      "x": 104,
+      "y": 558
+    },
+    {
+      "h": 28,
+      "name": "lightspeed_position_row",
+      "w": 185,
+      "x": 104,
+      "y": 412
+    },
+    {
+      "h": 87,
+      "name": "sphl_positions",
+      "w": 187,
+      "x": 247,
+      "y": 408
+    },
+    {
+      "h": 88,
+      "name": "bnkk_sphl_positions",
+      "w": 190,
+      "x": 0,
+      "y": 403
+    },
+    {
+      "h": 78,
+      "name": "positions_table",
+      "w": 189,
+      "x": 0,
+      "y": 404
+    },
+    {
+      "name": "lightspeed_positions_table",
+      "x": 0,
+      "y": 600,
+      "w": 300,
+      "h": 170,
+      "comment": "Full Lightspeed positions window for dynamic row detection"
+    },
+    {
+      "name": "lightspeed_pos_row_0",
+      "x": 0,
+      "y": 627,
+      "w": 300,
+      "h": 8,
+      "comment": "BNKK row (first position)"
+    },
+    {
+      "name": "lightspeed_pos_row_1",
+      "x": 0,
+      "y": 638,
+      "w": 300,
+      "h": 8,
+      "comment": "SPHL row (second position)"
+    },
+    {
+      "name": "lightspeed_pos_row_2",
+      "x": 0,
+      "y": 649,
+      "w": 300,
+      "h": 8,
+      "comment": "CJMB row (third position)"
+    },
+    {
+      "name": "lightspeed_pos_all",
+      "x": 0,
+      "y": 657,
+      "w": 300,
+      "h": 8,
+      "comment": "All summary row"
+    },
+    {
+      "name": "screenshot_positions_table",
+      "x": 534,
+      "y": 333,
+      "w": 300,
+      "h": 170,
+      "comment": "Auto-detected from Screenshot 2026-01-16 050623.png"
+    },
+    {
+      "name": "screenshot_positions_table2",
+      "x": 9,
+      "y": 674,
+      "w": 225,
+      "h": 180,
+      "comment": "Auto-detected from header template match (scale 0.75)"
+    },
+    {
+      "name": "screenshot_positions_table3",
+      "x": 0,
+      "y": 674,
+      "w": 240,
+      "h": 110,
+      "comment": "Row templates matched at y~674 (scale 0.75-0.8)"
+    }
+  ]
+}

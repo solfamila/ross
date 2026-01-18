@@ -1,0 +1,19 @@
+# YOLO Training Configuration for Trading Window Detection
+# Usage: yolo train data=trading_windows.yaml model=yolov10n.pt epochs=50
+
+# Dataset paths (relative to this file)
+path: .  # Dataset root directory
+train: images  # Training images (relative to path)
+val: images    # Validation images (same as train for small datasets)
+
+# Class names - must match annotate.py CLASSES
+names:
+  0: positions_table
+  1: orders_table
+  2: watchlist
+  3: chart
+  4: row_header
+
+# Number of classes
+nc: 5
+
