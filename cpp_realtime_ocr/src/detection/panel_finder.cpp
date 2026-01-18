@@ -91,8 +91,7 @@ struct AnchorMatchResult {
 
 // Naive NCC (CPU). Intended for downscaled search images and small templates.
 static AnchorMatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int imgW, int imgH,
-                                         const std::vector<uint8_t>& tpl, int tplW, int tplH,
-                                         float minScore) {
+                                         const std::vector<uint8_t>& tpl, int tplW, int tplH) {
     AnchorMatchResult best;
     if (tplW <= 0 || tplH <= 0 || imgW < tplW || imgH < tplH) return best;
 
@@ -138,7 +137,7 @@ static AnchorMatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int i
 
             const double ncc = dot / (iDen * tDen);
             const float score = static_cast<float>(ncc);
-            if ((!best.found || score > best.score) && score >= minScore) {
+            if (!best.found || score > best.score) {
                 best.found = true;
                 best.score = score;
                 best.x = x;
@@ -179,7 +178,7 @@ static AnchorMatchResult findAnchorByTemplate(const std::vector<uint8_t>& imgGra
         if (tW > sW || tH > sH) continue;
 
         auto tplScaled = resizeGrayNearest(tplGray, tplW, tplH, tW, tH);
-        AnchorMatchResult m = matchTemplateNCC(searchImg, sW, sH, tplScaled, tW, tH, minScore);
+        AnchorMatchResult m = matchTemplateNCC(searchImg, sW, sH, tplScaled, tW, tH);
         if (m.found && (!best.found || m.score > best.score)) {
             best = m;
             best.tplScale = sc;
@@ -187,6 +186,11 @@ static AnchorMatchResult findAnchorByTemplate(const std::vector<uint8_t>& imgGra
     }
 
     if (!best.found) return best;
+
+    // Decide threshold pass.
+    if (best.score < minScore) {
+        best.found = false;
+    }
 
     // Map coordinates back to full-res.
     best.x = static_cast<int>(std::round(best.x / imgScale));

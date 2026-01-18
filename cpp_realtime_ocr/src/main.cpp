@@ -741,7 +741,7 @@ int main(int argc, char* argv[]) {
     // Phase 2: Panel auto-detection (offline with --video)
     bool detectPanels = false;
     std::string panelTemplateDir = "templates/headers";
-    float panelThreshold = 0.65f;
+    float panelThreshold = 0.55f;
     int panelEveryN = 1;
 
     // Column extraction parameters
@@ -1096,10 +1096,15 @@ int main(int argc, char* argv[]) {
             count++;
             emptyCount = 0;
 
-            const double frameTimeMs = static_cast<double>(frame.pts100ns) / 10000.0;
+            double frameTimeMs = static_cast<double>(frame.pts100ns) / 10000.0;
+            if (dec.fps() > 0.0) {
+                frameTimeMs = 1000.0 * (static_cast<double>(frame.frameIndex) / dec.fps());
+            }
 
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
+
+                float trigScore = -1.0f;
 
                 // Y plane -> tight grayscale buffer
                 std::vector<uint8_t> gray(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height));
@@ -1147,12 +1152,22 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Match target symbol in trigger ROI
-                float trigScore = sym.matchInGrayROI(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                trigScore = sym.matchInGrayROI(gray, frame.width, frame.height, trigRoi.triggerRoi);
                 profiler.markMatch(trigScore);
 
                 auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
                 profiler.markState(entry.state().armed, entry.state().triggered);
                 profiler.endFrame();
+
+                if (frame.frameIndex < 60) {
+                    std::cout
+                        << "frame=" << frame.frameIndex
+                    << " pts=" << frame.pts100ns
+                        << " havePanel=" << (havePanel ? "1" : "0")
+                        << " trigOk=" << (trigRoi.ok ? "1" : "0")
+                        << " trigScore=" << std::fixed << std::setprecision(3) << trigScore
+                        << "\n";
+                }
 
                 if (ev.fired) {
                     profiler.flush(profileJsonPath, profileSummaryPath);
@@ -1161,15 +1176,6 @@ int main(int argc, char* argv[]) {
                               << ev.absentLastTimeMs << "," << ev.presentFirstTimeMs << "]"
                               << " est_ms=(" << ev.absentLastTimeEstMs << "," << ev.presentFirstTimeEstMs << "]\n";
                     return 0;
-                }
-
-                if (frame.frameIndex % 30 == 0) {
-                    std::cout << "frame " << frame.frameIndex
-                              << " t=" << (frame.pts100ns / 1e7)
-                              << " havePanel=" << (havePanel ? "1" : "0")
-                              << " trigOK=" << (trigRoi.ok ? "1" : "0")
-                              << " score=" << std::fixed << std::setprecision(3) << trigScore
-                              << "\n";
                 }
                 continue;
             }

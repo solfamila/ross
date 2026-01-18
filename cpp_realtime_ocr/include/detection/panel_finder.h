@@ -42,7 +42,7 @@ struct FoundPanels {
 };
 
 struct PanelFinderConfig {
-    float hdrThreshold = 0.65f;
+    float hdrThreshold = 0.55f;
 
     // Downscale the search image to speed up matching (0 = disable)
     float maxSearchW = 640.0f;

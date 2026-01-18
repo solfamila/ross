@@ -189,10 +189,13 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameY& out, std::string& err) {
             &ts100ns,
             &sample);
 
-        std::cerr << "[MF] flags=0x" << std::hex << flags
-                  << " ts100ns=" << std::dec << ts100ns
-                  << " sample=" << (sample ? "yes" : "no")
-                  << "\n";
+        static int mfPrint = 0;
+        if (mfPrint++ < 5 || (flags != 0)) {
+            std::cerr << "[MF] flags=0x" << std::hex << flags
+                      << " ts100ns=" << std::dec << ts100ns
+                      << " sample=" << (sample ? "yes" : "no")
+                      << "\n";
+        }
 
         if (FAILED(hr)) {
             err = "ReadSample failed: " + hresultToString(hr);
