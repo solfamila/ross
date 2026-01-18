@@ -128,6 +128,8 @@ set(CPP_SOURCES
     src/capture/d3d11_capture.cpp
     src/capture/cuda_interop.cpp
     src/video/mf_source_reader.cpp
+    src/tracking/panel_tracker.cpp
+    src/tracking/edge_expand.cpp
     src/processing/roi_extractor.cpp
     src/processing/row_detector.cpp
     src/processing/template_matcher.cpp
@@ -135,6 +137,9 @@ set(CPP_SOURCES
     src/ocr/svtr_inference.cpp
     src/ocr/ctc_decoder.cpp
     src/detection/panel_finder.cpp
+    src/detection/symbol_matcher.cpp
+    src/detection/entry_trigger.cpp
+    src/detection/trigger_roi_builder.cpp
     src/detection/text_parser.cpp
     src/detection/change_detector.cpp
     src/detection/yolo_detector.cpp
@@ -142,6 +147,7 @@ set(CPP_SOURCES
     src/utils/roi_selector.cpp
     src/utils/roi_overlay.cpp
     src/utils/timer.cpp
+    src/utils/profiler.cpp
     src/utils/logger.cpp
     src/utils/image_loader.cpp
 )
@@ -155,6 +161,8 @@ set(HEADER_FILES
     include/capture/d3d11_capture.h
     include/capture/cuda_interop.h
     include/video/mf_source_reader.h
+    include/tracking/panel_tracker.h
+    include/tracking/edge_expand.h
     include/processing/roi_extractor.h
     include/processing/row_detector.h
     include/processing/template_matcher.h
@@ -163,6 +171,9 @@ set(HEADER_FILES
     include/ocr/svtr_inference.h
     include/ocr/ctc_decoder.h
     include/detection/panel_finder.h
+    include/detection/symbol_matcher.h
+    include/detection/entry_trigger.h
+    include/detection/trigger_roi_builder.h
     include/detection/text_parser.h
     include/detection/change_detector.h
     include/detection/yolo_detector.h
@@ -170,6 +181,7 @@ set(HEADER_FILES
     include/utils/roi_selector.h
     include/utils/roi_overlay.h
     include/utils/timer.h
+    include/utils/profiler.h
     include/utils/logger.h
     include/types.h
 )

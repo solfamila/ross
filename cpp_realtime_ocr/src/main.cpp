@@ -39,6 +39,9 @@
 #include "capture/cuda_interop.h"
 #include "detection/change_detector.h"
 #include "detection/panel_finder.h"
+#include "detection/symbol_matcher.h"
+#include "detection/entry_trigger.h"
+#include "detection/trigger_roi_builder.h"
 #include "detection/yolo_detector.h"
 #include "ocr/ctc_decoder.h"
 #include "ocr/svtr_inference.h"
@@ -50,7 +53,10 @@
 #include "utils/roi_selector.h"
 #include "utils/roi_overlay.h"
 #include "utils/timer.h"
+#include "utils/profiler.h"
 #include "video/mf_source_reader.h"
+
+#include "tracking/panel_tracker.h"
 
 namespace fs = std::filesystem;
 
@@ -399,6 +405,23 @@ static void bgraToGray(const uint8_t* bgra, int w, int h, std::vector<uint8_t>& 
     }
 }
 
+// Stride-aware BGRA->grayscale (needed for Media Foundation decode frames).
+static void bgraToGrayStride(const uint8_t* bgra, int w, int h, int strideBytes,
+                             std::vector<uint8_t>& outGray) {
+    outGray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = bgra + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
+        uint8_t* out = outGray.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        for (int x = 0; x < w; ++x) {
+            const uint8_t b = row[x * 4 + 0];
+            const uint8_t g = row[x * 4 + 1];
+            const uint8_t r = row[x * 4 + 2];
+            const int gray = (static_cast<int>(r) * 77 + static_cast<int>(g) * 150 + static_cast<int>(b) * 29) >> 8;
+            out[x] = static_cast<uint8_t>(gray);
+        }
+    }
+}
+
 static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH) {
     std::vector<uint8_t> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
     for (int y = 0; y < dstH; ++y) {
@@ -724,6 +747,14 @@ int main(int argc, char* argv[]) {
     std::string videoPath;
     int videoMaxFrames = 0; // 0 = decode until EOF
 
+    // Entry-trigger mode (timing-first)
+    std::string modeStr = "panel-detect"; // panel-detect | entry-trigger
+    std::string targetSymbol;
+    double delayCompMs = 0.0;
+    bool enableProfile = false;
+    std::string profileJsonPath;
+    std::string profileSummaryPath;
+
     // Phase 2: Panel auto-detection (offline with --video)
     bool detectPanels = false;
     std::string panelTemplateDir = "templates/headers";
@@ -793,6 +824,18 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "--video" && i + 1 < argc) {
             videoPath = argv[++i];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            modeStr = argv[++i];
+        } else if (arg == "--target" && i + 1 < argc) {
+            targetSymbol = argv[++i];
+        } else if (arg == "--delay-compensation-ms" && i + 1 < argc) {
+            delayCompMs = std::stod(argv[++i]);
+        } else if (arg == "--profile") {
+            enableProfile = true;
+        } else if (arg == "--profile-output" && i + 1 < argc) {
+            profileJsonPath = argv[++i];
+        } else if (arg == "--profile-summary" && i + 1 < argc) {
+            profileSummaryPath = argv[++i];
         } else if (arg == "--video-max-frames" && i + 1 < argc) {
             videoMaxFrames = (std::max)(0, std::stoi(argv[++i]));
         } else if (arg == "--detect-panels") {
@@ -977,12 +1020,18 @@ int main(int argc, char* argv[]) {
         std::string err;
         std::string resolved = resolvePathWithFallbacks(videoPath);
 
+        const bool entryTriggerMode = (modeStr == "entry-trigger");
+        if (entryTriggerMode && targetSymbol.empty()) {
+            std::cerr << "ERROR: --mode entry-trigger requires --target <SYMBOL>\n";
+            return 1;
+        }
+
         trading_monitor::detect::PanelFinder panelFinder;
         trading_monitor::detect::PanelFinderConfig panelCfg;
         panelCfg.hdrThreshold = panelThreshold;
         panelCfg.maxSearchW = 640.0f;
 
-        if (detectPanels) {
+        if (detectPanels || entryTriggerMode) {
             const std::string resolvedDir = resolvePathWithFallbacks(panelTemplateDir);
             const std::string positionsHdr = (fs::path(resolvedDir) / "positions_hdr.png").string();
             const std::string orderHdr = (fs::path(resolvedDir) / "order_hdr.png").string();
@@ -1014,10 +1063,106 @@ int main(int argc, char* argv[]) {
 
         uint64_t detectCount = 0;
 
+        // Entry-trigger pipeline state (optional)
+        trading_monitor::detect::SymbolMatcher sym;
+        trading_monitor::detect::EntryTrigger entry({});
+        trading_monitor::detect::TriggerRoiBuilder trigBuilder;
+        trading_monitor::detect::TriggerRoiConfig trigCfg;
+        trading_monitor::detect::TriggerRoiResult trigRoi;
+        trading_monitor::track::PanelTracker tracker;
+        trading_monitor::track::TrackerConfig trackCfg;
+        trading_monitor::Profiler profiler(enableProfile);
+        uint64_t lastTrigBuildFrame = 0;
+
+        trading_monitor::track::HeaderTemplate hdrTpl;
+        if (entryTriggerMode) {
+            // Load symbol templates (expected: templates/symbols/<SYMBOL>_*.png)
+            const std::string symDir = resolvePathWithFallbacks("templates/symbols");
+            if (!sym.loadSymbolTemplates(symDir, targetSymbol, err)) {
+                std::cerr << "ERROR: Symbol template load failed: " << err << "\n";
+                return 1;
+            }
+            trading_monitor::detect::EntryTriggerConfig ecfg;
+            ecfg.delayCompensationMs = delayCompMs;
+            entry = trading_monitor::detect::EntryTrigger(ecfg);
+            entry.setTargetSymbol(targetSymbol);
+
+            // Load the positions header template into a HeaderTemplate for tracking.
+            const std::string resolvedDir = resolvePathWithFallbacks(panelTemplateDir);
+            const std::string positionsHdr = (fs::path(resolvedDir) / "positions_hdr.png").string();
+            if (!loadTemplateGray(positionsHdr, hdrTpl.gray, hdrTpl.w, hdrTpl.h)) {
+                std::cerr << "ERROR: Failed to load positions header for tracking: " << positionsHdr << "\n";
+                return 1;
+            }
+        }
+
         while (g_running) {
             if (videoMaxFrames > 0 && count >= static_cast<uint64_t>(videoMaxFrames)) break;
             if (!dec.readFrame(frame, err)) break;
             count++;
+
+            if (entryTriggerMode) {
+                profiler.beginFrame(frame.frameIndex);
+
+                // BGRA->gray (stride-aware)
+                std::vector<uint8_t> gray;
+                bgraToGrayStride(frame.pixels.data(), frame.width, frame.height, frame.strideBytes, gray);
+                profiler.markGray();
+
+                // Acquire positions panel (once) or re-acquire if tracking fails
+                static bool havePanel = false;
+                static trading_monitor::detect::FoundPanels found{};
+
+                if (!havePanel) {
+                    found = panelFinder.findPanelsFromBGRA(frame.pixels.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
+                    profiler.markFind();
+                    if (!found.hasPositions) {
+                        profiler.endFrame();
+                        continue;
+                    }
+                    tracker.init(hdrTpl, found.positionsHeader, found.positionsPanel);
+                    havePanel = true;
+                } else {
+                    auto tr = tracker.update(gray, frame.width, frame.height, trackCfg, frame.frameIndex, true);
+                    profiler.markTrack();
+                    if (!tr.ok) {
+                        havePanel = false;
+                        profiler.endFrame();
+                        continue;
+                    }
+                    found.positionsPanel = tr.panelRect;
+                    found.positionsHeader = tr.headerRect;
+                }
+
+                // Build trigger ROI periodically (no hardcoded columns)
+                if (!trigRoi.ok || (frame.frameIndex - lastTrigBuildFrame) >= (uint64_t)trigCfg.rebuildEveryNFrames) {
+                    trigRoi = trigBuilder.build(gray, frame.width, frame.height, found.positionsPanel, trigCfg);
+                    lastTrigBuildFrame = frame.frameIndex;
+                    profiler.markRoiBuild();
+                }
+                if (!trigRoi.ok) {
+                    profiler.endFrame();
+                    continue;
+                }
+
+                // Match target symbol in trigger ROI
+                float trigScore = sym.matchInGrayROI(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                profiler.markMatch(trigScore);
+
+                auto ev = entry.update(frame.frameIndex, frame.timestampMs, -1.f, -1.f, trigScore);
+                profiler.markState(entry.state().armed, entry.state().triggered);
+                profiler.endFrame();
+
+                if (ev.fired) {
+                    profiler.flush(profileJsonPath, profileSummaryPath);
+                    std::cout << "\n[entry-trigger] " << targetSymbol
+                              << " window_ms=(" << std::fixed << std::setprecision(2)
+                              << ev.absentLastTimeMs << "," << ev.presentFirstTimeMs << "]"
+                              << " est_ms=(" << ev.absentLastTimeEstMs << "," << ev.presentFirstTimeEstMs << "]\n";
+                    return 0;
+                }
+                continue;
+            }
 
             if (detectPanels && ((count - 1) % static_cast<uint64_t>(panelEveryN) == 0)) {
                 const auto found = panelFinder.findPanelsFromBGRA(
@@ -1052,6 +1197,10 @@ int main(int argc, char* argv[]) {
 
                 detectCount++;
             }
+        }
+
+        if (entryTriggerMode) {
+            profiler.flush(profileJsonPath, profileSummaryPath);
         }
 
         const auto t1 = std::chrono::steady_clock::now();
