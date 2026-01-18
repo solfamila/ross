@@ -1101,12 +1101,14 @@ int main(int argc, char* argv[]) {
             if (!dec.readFrame(frame, err)) break;
             count++;
 
+            const double frameTimeMs = static_cast<double>(frame.pts100ns) / 10000.0;
+
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
 
                 // BGRA->gray (stride-aware)
                 std::vector<uint8_t> gray;
-                bgraToGrayStride(frame.pixels.data(), frame.width, frame.height, frame.strideBytes, gray);
+                bgraToGrayStride(frame.bgra.data(), frame.width, frame.height, frame.strideBytes, gray);
                 profiler.markGray();
 
                 // Acquire positions panel (once) or re-acquire if tracking fails
@@ -1114,7 +1116,7 @@ int main(int argc, char* argv[]) {
                 static trading_monitor::detect::FoundPanels found{};
 
                 if (!havePanel) {
-                    found = panelFinder.findPanelsFromBGRA(frame.pixels.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
+                    found = panelFinder.findPanelsFromBGRA(frame.bgra.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
                     profiler.markFind();
                     if (!found.hasPositions) {
                         profiler.endFrame();
@@ -1149,7 +1151,7 @@ int main(int argc, char* argv[]) {
                 float trigScore = sym.matchInGrayROI(gray, frame.width, frame.height, trigRoi.triggerRoi);
                 profiler.markMatch(trigScore);
 
-                auto ev = entry.update(frame.frameIndex, frame.timestampMs, -1.f, -1.f, trigScore);
+                auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
                 profiler.markState(entry.state().armed, entry.state().triggered);
                 profiler.endFrame();
 
@@ -1166,10 +1168,10 @@ int main(int argc, char* argv[]) {
 
             if (detectPanels && ((count - 1) % static_cast<uint64_t>(panelEveryN) == 0)) {
                 const auto found = panelFinder.findPanelsFromBGRA(
-                    frame.pixels.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
+                    frame.bgra.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
 
                 std::cout << "\n[panel-detect] frame=" << count << " ts_ms=" << std::fixed << std::setprecision(2)
-                          << frame.timestampMs << "\n";
+                          << frameTimeMs << "\n";
 
                 if (found.hasPositions) {
                     std::cout << "  positions: score=" << std::fixed << std::setprecision(3) << found.scorePositions << "\n";
