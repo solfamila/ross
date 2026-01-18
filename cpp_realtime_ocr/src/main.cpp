@@ -405,20 +405,14 @@ static void bgraToGray(const uint8_t* bgra, int w, int h, std::vector<uint8_t>& 
     }
 }
 
-// Stride-aware BGRA->grayscale (needed for Media Foundation decode frames).
-static void bgraToGrayStride(const uint8_t* bgra, int w, int h, int strideBytes,
+// Stride-aware NV12 -> grayscale (Y plane only).
+static void nv12ToGrayStride(const uint8_t* nv12, int w, int h, int strideBytes,
                              std::vector<uint8_t>& outGray) {
     outGray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
     for (int y = 0; y < h; ++y) {
-        const uint8_t* row = bgra + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
+        const uint8_t* row = nv12 + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
         uint8_t* out = outGray.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
-        for (int x = 0; x < w; ++x) {
-            const uint8_t b = row[x * 4 + 0];
-            const uint8_t g = row[x * 4 + 1];
-            const uint8_t r = row[x * 4 + 2];
-            const int gray = (static_cast<int>(r) * 77 + static_cast<int>(g) * 150 + static_cast<int>(b) * 29) >> 8;
-            out[x] = static_cast<uint8_t>(gray);
-        }
+        std::memcpy(out, row, static_cast<size_t>(w));
     }
 }
 
@@ -1057,7 +1051,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  FPS~:   " << std::fixed << std::setprecision(3) << dec.fps() << "\n";
         }
 
-        trading_monitor::video::VideoFrameBGRA frame;
+        trading_monitor::video::VideoFrameNV12 frame;
         uint64_t count = 0;
         const auto t0 = std::chrono::steady_clock::now();
 
@@ -1108,7 +1102,7 @@ int main(int argc, char* argv[]) {
 
                 // BGRA->gray (stride-aware)
                 std::vector<uint8_t> gray;
-                bgraToGrayStride(frame.bgra.data(), frame.width, frame.height, frame.strideBytes, gray);
+                nv12ToGrayStride(frame.nv12.data(), frame.width, frame.height, frame.strideBytes, gray);
                 profiler.markGray();
 
                 // Acquire positions panel (once) or re-acquire if tracking fails
@@ -1116,7 +1110,7 @@ int main(int argc, char* argv[]) {
                 static trading_monitor::detect::FoundPanels found{};
 
                 if (!havePanel) {
-                    found = panelFinder.findPanelsFromBGRA(frame.bgra.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
+                    found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
                     profiler.markFind();
                     if (!found.hasPositions) {
                         profiler.endFrame();
@@ -1167,8 +1161,10 @@ int main(int argc, char* argv[]) {
             }
 
             if (detectPanels && ((count - 1) % static_cast<uint64_t>(panelEveryN) == 0)) {
-                const auto found = panelFinder.findPanelsFromBGRA(
-                    frame.bgra.data(), frame.width, frame.height, frame.strideBytes, panelCfg);
+                std::vector<uint8_t> gray;
+                nv12ToGrayStride(frame.nv12.data(), frame.width, frame.height, frame.strideBytes, gray);
+
+                const auto found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
 
                 std::cout << "\n[panel-detect] frame=" << count << " ts_ms=" << std::fixed << std::setprecision(2)
                           << frameTimeMs << "\n";

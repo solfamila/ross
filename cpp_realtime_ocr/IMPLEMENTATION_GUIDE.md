@@ -39,11 +39,19 @@
 ### Build
 
 ```powershell
-# Open Visual Studio Developer Command Prompt or PowerShell
+# Recommended (Windows): use the repo build script (sets up VS DevCmd correctly)
 cd cpp_realtime_ocr
-mkdir build && cd build
+cmd.exe /d /s /c ".\\build.cmd Release"
+
+# If you prefer a one-liner without the script, you MUST run under VS DevCmd so
+# MSVC standard headers + Windows SDK headers are on the include path:
+cmd.exe /d /s /c '"C:\\Program Files\\Microsoft Visual Studio\\18\\Insiders\\Common7\\Tools\\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 & cmake --build "C:\\Users\\forfr\\Downloads\\trade\\cpp_realtime_ocr\\build" --config Release -j 4'
+
+# Manual configure (first time) + build (Ninja single-config)
+cd cpp_realtime_ocr
+mkdir build; cd build
 cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja
+cmake --build . -j 4
 ```
 
 ### Basic Usage

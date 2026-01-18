@@ -11,19 +11,19 @@
 
 namespace trading_monitor::video {
 
-struct VideoFrameBGRA {
+struct VideoFrameNV12 {
     int width = 0;
     int height = 0;
-    int strideBytes = 0;  // bytes per row
+    int strideBytes = 0;  // bytes per row (Y and UV planes)
     int64_t pts100ns = 0; // presentation timestamp in 100ns units
     uint64_t frameIndex = 0;
 
-    // BGRA32 pixel buffer (size = strideBytes * height)
-    std::vector<uint8_t> bgra;
+    // NV12 pixel buffer (size = strideBytes * (height + height/2))
+    std::vector<uint8_t> nv12;
 };
 
 // Media Foundation source reader decoder for offline MP4 (and other MF-supported sources).
-// Output is requested as MFVideoFormat_ARGB32, which is typically BGRA byte order in memory.
+// Output is requested as MFVideoFormat_NV12 for maximum decoder compatibility.
 class MFSourceReaderDecoder {
 public:
     MFSourceReaderDecoder() = default;
@@ -37,7 +37,7 @@ public:
 
     // Returns true and fills `out` when a frame is produced.
     // Returns false on EOF or error; `err` is set.
-    bool readFrame(VideoFrameBGRA& out, std::string& err);
+    bool readFrame(VideoFrameNV12& out, std::string& err);
 
     int width() const { return m_width; }
     int height() const { return m_height; }

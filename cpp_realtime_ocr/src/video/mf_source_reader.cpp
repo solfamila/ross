@@ -106,7 +106,7 @@ bool MFSourceReaderDecoder::configureOutputType(std::string& err) {
         return false;
     }
 
-    // Force output to 32-bit BGRA-like format.
+    // Force output to NV12 for maximum decoder compatibility.
     Microsoft::WRL::ComPtr<IMFMediaType> type;
     HRESULT hr = MFCreateMediaType(&type);
     if (FAILED(hr)) {
@@ -120,8 +120,7 @@ bool MFSourceReaderDecoder::configureOutputType(std::string& err) {
         return false;
     }
 
-    // MFVideoFormat_ARGB32 is typically BGRA in memory on little-endian.
-    hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
+    hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     if (FAILED(hr)) {
         err = "SetGUID(MF_MT_SUBTYPE) failed: " + hresultToString(hr);
         return false;
@@ -129,7 +128,7 @@ bool MFSourceReaderDecoder::configureOutputType(std::string& err) {
 
     hr = m_reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, type.Get());
     if (FAILED(hr)) {
-        err = "SetCurrentMediaType(BGRA32) failed: " + hresultToString(hr);
+        err = "SetCurrentMediaType(NV12) failed: " + hresultToString(hr);
         return false;
     }
 
@@ -169,7 +168,7 @@ bool MFSourceReaderDecoder::queryFrameSizeAndRate(std::string& err) {
     return true;
 }
 
-bool MFSourceReaderDecoder::readFrame(VideoFrameBGRA& out, std::string& err) {
+bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
     if (!m_reader) {
         err = "Decoder not open";
         return false;
@@ -268,21 +267,22 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameBGRA& out, std::string& err) {
         out.pts100ns = static_cast<int64_t>(ts100ns);
         out.frameIndex = m_frameIndex++;
 
-        out.bgra.resize(static_cast<size_t>(out.strideBytes) * static_cast<size_t>(out.height));
+        const int totalRows = out.height + (out.height / 2);
+        out.nv12.resize(static_cast<size_t>(out.strideBytes) * static_cast<size_t>(totalRows));
 
-        // Copy row-by-row to handle negative stride / padding safely.
+        // Copy row-by-row to handle stride / padding safely.
         const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(data);
         if (stride > 0) {
-            for (int y = 0; y < out.height; ++y) {
+            for (int y = 0; y < totalRows; ++y) {
                 const uint8_t* srcRow = srcBase + static_cast<size_t>(y) * static_cast<size_t>(absStride);
-                uint8_t* dstRow = out.bgra.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
+                uint8_t* dstRow = out.nv12.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
                 std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideBytes));
             }
         } else {
             // Bottom-up
-            for (int y = 0; y < out.height; ++y) {
-                const uint8_t* srcRow = srcBase + static_cast<size_t>(out.height - 1 - y) * static_cast<size_t>(absStride);
-                uint8_t* dstRow = out.bgra.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
+            for (int y = 0; y < totalRows; ++y) {
+                const uint8_t* srcRow = srcBase + static_cast<size_t>(totalRows - 1 - y) * static_cast<size_t>(absStride);
+                uint8_t* dstRow = out.nv12.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
                 std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideBytes));
             }
         }

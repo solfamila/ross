@@ -73,6 +73,10 @@ public:
     FoundPanels findPanelsFromBGRA(const uint8_t* bgra, int w, int h, int strideBytes,
                                    const PanelFinderConfig& cfg) const;
 
+    // Use precomputed grayscale image (size = w*h)
+    FoundPanels findPanelsFromGray(const uint8_t* gray, int w, int h,
+                                   const PanelFinderConfig& cfg) const;
+
 private:
     PanelTemplates m_tpl;
 };

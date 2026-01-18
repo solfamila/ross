@@ -37,6 +37,7 @@ static void bgraToGray(const uint8_t* bgra, int w, int h, int strideBytes, std::
     }
 }
 
+
 static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH) {
     std::vector<uint8_t> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
     for (int y = 0; y < dstH; ++y) {
@@ -301,6 +302,49 @@ static ROI expandHeaderToPanelEdges(const ROI& header, const std::vector<uint8_t
     return out;
 }
 
+static FoundPanels findPanelsFromGrayImpl(const uint8_t* grayPtr, int w, int h,
+                                         const PanelFinderConfig& cfg, const PanelTemplates& tpl) {
+    FoundPanels out;
+    if (!grayPtr || w <= 0 || h <= 0) return out;
+
+    std::vector<uint8_t> gray(grayPtr, grayPtr + (static_cast<size_t>(w) * static_cast<size_t>(h)));
+
+    if (!tpl.positionsHdr.empty()) {
+        auto m = findAnchorByTemplate(gray, w, h, tpl.positionsHdr, tpl.positionsW, tpl.positionsH,
+                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        if (m.found) {
+            out.hasPositions = true;
+            out.scorePositions = m.score;
+            out.positionsHeader = clampROI(ROI{"positions_header", m.x, m.y, m.w, m.h}, w, h);
+            out.positionsPanel = expandHeaderToPanelEdges(out.positionsHeader, gray, w, h, cfg, "positions_panel");
+        }
+    }
+
+    if (!tpl.orderHdr.empty()) {
+        auto m = findAnchorByTemplate(gray, w, h, tpl.orderHdr, tpl.orderW, tpl.orderH,
+                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        if (m.found) {
+            out.hasOrder = true;
+            out.scoreOrder = m.score;
+            out.orderHeader = clampROI(ROI{"order_header", m.x, m.y, m.w, m.h}, w, h);
+            out.orderPanel = expandHeaderToPanelEdges(out.orderHeader, gray, w, h, cfg, "order_panel");
+        }
+    }
+
+    if (!tpl.quoteHdr.empty()) {
+        auto m = findAnchorByTemplate(gray, w, h, tpl.quoteHdr, tpl.quoteW, tpl.quoteH,
+                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        if (m.found) {
+            out.hasQuote = true;
+            out.scoreQuote = m.score;
+            out.quoteHeader = clampROI(ROI{"quote_header", m.x, m.y, m.w, m.h}, w, h);
+            out.quotePanel = expandHeaderToPanelEdges(out.quoteHeader, gray, w, h, cfg, "quote_panel");
+        }
+    }
+
+    return out;
+}
+
 } // namespace
 
 bool PanelFinder::loadTemplates(const std::string& positionsHdrPath,
@@ -333,46 +377,15 @@ bool PanelFinder::loadTemplates(const std::string& positionsHdrPath,
 
 FoundPanels PanelFinder::findPanelsFromBGRA(const uint8_t* bgra, int w, int h, int strideBytes,
                                            const PanelFinderConfig& cfg) const {
-    FoundPanels out;
-    if (!bgra || w <= 0 || h <= 0 || strideBytes <= 0) return out;
-
     std::vector<uint8_t> gray;
+    if (!bgra || w <= 0 || h <= 0 || strideBytes <= 0) return {};
     bgraToGray(bgra, w, h, strideBytes, gray);
+    return findPanelsFromGrayImpl(gray.data(), w, h, cfg, m_tpl);
+}
 
-    if (!m_tpl.positionsHdr.empty()) {
-        auto m = findAnchorByTemplate(gray, w, h, m_tpl.positionsHdr, m_tpl.positionsW, m_tpl.positionsH,
-                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
-        if (m.found) {
-            out.hasPositions = true;
-            out.scorePositions = m.score;
-            out.positionsHeader = clampROI(ROI{"positions_header", m.x, m.y, m.w, m.h}, w, h);
-            out.positionsPanel = expandHeaderToPanelEdges(out.positionsHeader, gray, w, h, cfg, "positions_panel");
-        }
-    }
-
-    if (!m_tpl.orderHdr.empty()) {
-        auto m = findAnchorByTemplate(gray, w, h, m_tpl.orderHdr, m_tpl.orderW, m_tpl.orderH,
-                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
-        if (m.found) {
-            out.hasOrder = true;
-            out.scoreOrder = m.score;
-            out.orderHeader = clampROI(ROI{"order_header", m.x, m.y, m.w, m.h}, w, h);
-            out.orderPanel = expandHeaderToPanelEdges(out.orderHeader, gray, w, h, cfg, "order_panel");
-        }
-    }
-
-    if (!m_tpl.quoteHdr.empty()) {
-        auto m = findAnchorByTemplate(gray, w, h, m_tpl.quoteHdr, m_tpl.quoteW, m_tpl.quoteH,
-                                      cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
-        if (m.found) {
-            out.hasQuote = true;
-            out.scoreQuote = m.score;
-            out.quoteHeader = clampROI(ROI{"quote_header", m.x, m.y, m.w, m.h}, w, h);
-            out.quotePanel = expandHeaderToPanelEdges(out.quoteHeader, gray, w, h, cfg, "quote_panel");
-        }
-    }
-
-    return out;
+FoundPanels PanelFinder::findPanelsFromGray(const uint8_t* gray, int w, int h,
+                                           const PanelFinderConfig& cfg) const {
+    return findPanelsFromGrayImpl(gray, w, h, cfg, m_tpl);
 }
 
 } // namespace trading_monitor::detect

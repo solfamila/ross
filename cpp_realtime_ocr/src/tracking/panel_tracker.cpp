@@ -6,7 +6,7 @@
 #include <cstring>
 
 namespace {
-static ROI clampROI(const trading_monitor::ROI& r, int W, int H) {
+static trading_monitor::ROI clampROI(const trading_monitor::ROI& r, int W, int H) {
     trading_monitor::ROI out = r;
     out.x = std::max(0, std::min(out.x, W - 1));
     out.y = std::max(0, std::min(out.y, H - 1));

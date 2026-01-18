@@ -1,6 +1,7 @@
 #include "utils/profiler.h"
 
 #include <Windows.h>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <numeric>
