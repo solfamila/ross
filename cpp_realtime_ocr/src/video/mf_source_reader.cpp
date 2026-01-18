@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 
 #include <combaseapi.h>
@@ -168,7 +169,7 @@ bool MFSourceReaderDecoder::queryFrameSizeAndRate(std::string& err) {
     return true;
 }
 
-bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
+bool MFSourceReaderDecoder::readFrame(VideoFrameY& out, std::string& err) {
     if (!m_reader) {
         err = "Decoder not open";
         return false;
@@ -188,6 +189,11 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
             &ts100ns,
             &sample);
 
+        std::cerr << "[MF] flags=0x" << std::hex << flags
+                  << " ts100ns=" << std::dec << ts100ns
+                  << " sample=" << (sample ? "yes" : "no")
+                  << "\n";
+
         if (FAILED(hr)) {
             err = "ReadSample failed: " + hresultToString(hr);
             return false;
@@ -199,8 +205,9 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
         }
 
         if (flags & MF_SOURCE_READERF_STREAMTICK) {
-            // Discontinuity; try again.
-            continue;
+            // Not a decoded frame; caller should continue.
+            err = "STREAMTICK";
+            return false;
         }
 
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
@@ -209,8 +216,8 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
         }
 
         if (!sample) {
-            // Not fatal; try again.
-            continue;
+            err = "NOSAMPLE";
+            return false;
         }
 
         Microsoft::WRL::ComPtr<IMFMediaBuffer> buf;
@@ -263,27 +270,26 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameNV12& out, std::string& err) {
 
         out.width = m_width;
         out.height = m_height;
-        out.strideBytes = absStride;
+        out.strideY = absStride;
         out.pts100ns = static_cast<int64_t>(ts100ns);
         out.frameIndex = m_frameIndex++;
 
-        const int totalRows = out.height + (out.height / 2);
-        out.nv12.resize(static_cast<size_t>(out.strideBytes) * static_cast<size_t>(totalRows));
+        out.y.resize(static_cast<size_t>(out.strideY) * static_cast<size_t>(out.height));
 
-        // Copy row-by-row to handle stride / padding safely.
+        // Copy Y plane row-by-row to handle stride safely.
         const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(data);
         if (stride > 0) {
-            for (int y = 0; y < totalRows; ++y) {
+            for (int y = 0; y < out.height; ++y) {
                 const uint8_t* srcRow = srcBase + static_cast<size_t>(y) * static_cast<size_t>(absStride);
-                uint8_t* dstRow = out.nv12.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
-                std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideBytes));
+                uint8_t* dstRow = out.y.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideY);
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideY));
             }
         } else {
             // Bottom-up
-            for (int y = 0; y < totalRows; ++y) {
-                const uint8_t* srcRow = srcBase + static_cast<size_t>(totalRows - 1 - y) * static_cast<size_t>(absStride);
-                uint8_t* dstRow = out.nv12.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideBytes);
-                std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideBytes));
+            for (int y = 0; y < out.height; ++y) {
+                const uint8_t* srcRow = srcBase + static_cast<size_t>(out.height - 1 - y) * static_cast<size_t>(absStride);
+                uint8_t* dstRow = out.y.data() + static_cast<size_t>(y) * static_cast<size_t>(out.strideY);
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(out.strideY));
             }
         }
 

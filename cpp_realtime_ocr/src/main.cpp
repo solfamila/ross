@@ -405,17 +405,6 @@ static void bgraToGray(const uint8_t* bgra, int w, int h, std::vector<uint8_t>& 
     }
 }
 
-// Stride-aware NV12 -> grayscale (Y plane only).
-static void nv12ToGrayStride(const uint8_t* nv12, int w, int h, int strideBytes,
-                             std::vector<uint8_t>& outGray) {
-    outGray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* row = nv12 + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
-        uint8_t* out = outGray.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
-        std::memcpy(out, row, static_cast<size_t>(w));
-    }
-}
-
 static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH) {
     std::vector<uint8_t> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
     for (int y = 0; y < dstH; ++y) {
@@ -1051,11 +1040,13 @@ int main(int argc, char* argv[]) {
             std::cout << "  FPS~:   " << std::fixed << std::setprecision(3) << dec.fps() << "\n";
         }
 
-        trading_monitor::video::VideoFrameNV12 frame;
+        trading_monitor::video::VideoFrameY frame;
         uint64_t count = 0;
         const auto t0 = std::chrono::steady_clock::now();
 
         uint64_t detectCount = 0;
+        int emptyCount = 0;
+        const int kMaxEmpty = 300;
 
         // Entry-trigger pipeline state (optional)
         trading_monitor::detect::SymbolMatcher sym;
@@ -1092,17 +1083,31 @@ int main(int argc, char* argv[]) {
 
         while (g_running) {
             if (videoMaxFrames > 0 && count >= static_cast<uint64_t>(videoMaxFrames)) break;
-            if (!dec.readFrame(frame, err)) break;
+            if (!dec.readFrame(frame, err)) {
+                if (err == "STREAMTICK" || err == "NOSAMPLE") {
+                    if (++emptyCount > kMaxEmpty) {
+                        std::cerr << "MF decoder produced no frames after many attempts.\n";
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
             count++;
+            emptyCount = 0;
 
             const double frameTimeMs = static_cast<double>(frame.pts100ns) / 10000.0;
 
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
 
-                // BGRA->gray (stride-aware)
-                std::vector<uint8_t> gray;
-                nv12ToGrayStride(frame.nv12.data(), frame.width, frame.height, frame.strideBytes, gray);
+                // Y plane -> tight grayscale buffer
+                std::vector<uint8_t> gray(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height));
+                for (int y = 0; y < frame.height; ++y) {
+                    const uint8_t* srcRow = frame.y.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.strideY);
+                    uint8_t* dstRow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.width);
+                    std::memcpy(dstRow, srcRow, static_cast<size_t>(frame.width));
+                }
                 profiler.markGray();
 
                 // Acquire positions panel (once) or re-acquire if tracking fails
@@ -1157,12 +1162,25 @@ int main(int argc, char* argv[]) {
                               << " est_ms=(" << ev.absentLastTimeEstMs << "," << ev.presentFirstTimeEstMs << "]\n";
                     return 0;
                 }
+
+                if (frame.frameIndex % 30 == 0) {
+                    std::cout << "frame " << frame.frameIndex
+                              << " t=" << (frame.pts100ns / 1e7)
+                              << " havePanel=" << (havePanel ? "1" : "0")
+                              << " trigOK=" << (trigRoi.ok ? "1" : "0")
+                              << " score=" << std::fixed << std::setprecision(3) << trigScore
+                              << "\n";
+                }
                 continue;
             }
 
             if (detectPanels && ((count - 1) % static_cast<uint64_t>(panelEveryN) == 0)) {
-                std::vector<uint8_t> gray;
-                nv12ToGrayStride(frame.nv12.data(), frame.width, frame.height, frame.strideBytes, gray);
+                std::vector<uint8_t> gray(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height));
+                for (int y = 0; y < frame.height; ++y) {
+                    const uint8_t* srcRow = frame.y.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.strideY);
+                    uint8_t* dstRow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.width);
+                    std::memcpy(dstRow, srcRow, static_cast<size_t>(frame.width));
+                }
 
                 const auto found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
 

@@ -49,3 +49,27 @@ Thumbs.db
 # Logs
 *.log
 
+# Local datasets / videos / artifacts (do not commit)
+*.mp4
+*.zip
+*.patch
+
+# Local analysis scripts (root only)
+/*.py
+
+# Local outputs (root)
+out/
+out*/
+transcripts/
+realtime_ocr/
+
+# Local configs generated during experiments (root)
+roi_config*.json
+
+# Local helper scripts
+cpp_realtime_ocr/build.ps1
+
+# Temp GUID-like items seen locally
+395a5723-f1e9-11f0-9069-4845e64639d0
+39872195-f1e9-11f0-b660-4845e64639d0
+

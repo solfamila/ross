@@ -11,15 +11,15 @@
 
 namespace trading_monitor::video {
 
-struct VideoFrameNV12 {
+struct VideoFrameY {
     int width = 0;
     int height = 0;
-    int strideBytes = 0;  // bytes per row (Y and UV planes)
+    int strideY = 0;  // bytes per row (Y plane)
     int64_t pts100ns = 0; // presentation timestamp in 100ns units
     uint64_t frameIndex = 0;
 
-    // NV12 pixel buffer (size = strideBytes * (height + height/2))
-    std::vector<uint8_t> nv12;
+    // Luma plane (size = strideY * height)
+    std::vector<uint8_t> y;
 };
 
 // Media Foundation source reader decoder for offline MP4 (and other MF-supported sources).
@@ -37,7 +37,7 @@ public:
 
     // Returns true and fills `out` when a frame is produced.
     // Returns false on EOF or error; `err` is set.
-    bool readFrame(VideoFrameNV12& out, std::string& err);
+    bool readFrame(VideoFrameY& out, std::string& err);
 
     int width() const { return m_width; }
     int height() const { return m_height; }
