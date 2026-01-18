@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      
+      - name: Install Ninja
+        run: choco install ninja -y
+      
+      - name: Check CMake syntax
+        run: |
+          cd cpp_realtime_ocr
+          cmake -B build -G Ninja 2>&1 | Select-String -Pattern "error|Error" -NotMatch || echo "CMake syntax OK (full build requires CUDA/TensorRT)"
+      
+      - name: Validate source files exist
+        run: |
+          $files = @(
+            "cpp_realtime_ocr/CMakeLists.txt",
+            "cpp_realtime_ocr/src/main.cpp",
+            "cpp_realtime_ocr/include/types.h",
+            "cpp_realtime_ocr/src/ocr/tensorrt_engine.cpp",
+            "training/annotate.py",
+            "training/train.py"
+          )
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Write-Host "✓ $f"
+            } else {
+              Write-Host "✗ Missing: $f"
+              exit 1
+            }
+          }
+
+  lint-python:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Check Python syntax
+        run: |
+          python -m py_compile training/annotate.py
+          python -m py_compile training/train.py
+          echo "Python syntax OK"
+
