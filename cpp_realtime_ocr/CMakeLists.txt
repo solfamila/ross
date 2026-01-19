@@ -63,6 +63,15 @@ endif()
 
 find_package(CUDAToolkit 13.0 REQUIRED)
 
+# Optional OpenCV (used for fast template matching / tracking in entry-trigger mode)
+find_package(OpenCV QUIET COMPONENTS core imgproc)
+if (OpenCV_FOUND)
+    message(STATUS "OpenCV found: ${OpenCV_VERSION}")
+    add_compile_definitions(TM_USE_OPENCV=1)
+else()
+    message(STATUS "OpenCV not found; falling back to slow NCC matcher. (Install OpenCV via vcpkg or system package for speed.)")
+endif()
+
 message(STATUS "CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
 message(STATUS "CUDA Toolkit Include: ${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -222,6 +231,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # JSON library
     nlohmann_json::nlohmann_json
 )
+
+if (OpenCV_FOUND)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
+endif()
 
 # Optional: TensorRT plugin library
 if(TENSORRT_NVINFER_PLUGIN)
