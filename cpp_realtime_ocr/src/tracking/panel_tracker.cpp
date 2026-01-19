@@ -2,6 +2,11 @@
 #include "tracking/edge_expand.h"
 
 #include <algorithm>
+
+#if defined(TM_USE_OPENCV)
+#include <opencv2/imgproc.hpp>
+#include <opencv2/core.hpp>
+#endif
 #include <cmath>
 #include <cstring>
 
@@ -48,6 +53,21 @@ struct MatchResult { bool found=false; float score=0; int x=0,y=0; };
 // Minimal NCC match: reuse your existing GPU NCC later if desired.
 static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int iH,
                                     const std::vector<uint8_t>& tpl, int tW, int tH) {
+#if defined(TM_USE_OPENCV)
+    MatchResult best;
+    if (tW <= 0 || tH <= 0 || iW < tW || iH < tH) return best;
+    cv::Mat imgMat(iH, iW, CV_8UC1, (void*)img.data());
+    cv::Mat tplMat(tH, tW, CV_8UC1, (void*)tpl.data());
+    cv::Mat res;
+    cv::matchTemplate(imgMat, tplMat, res, cv::TM_CCOEFF_NORMED);
+    double minv, maxv; cv::Point minp, maxp;
+    cv::minMaxLoc(res, &minv, &maxv, &minp, &maxp);
+    best.found = true;
+    best.score = static_cast<float>(maxv);
+    best.x = maxp.x;
+    best.y = maxp.y;
+    return best;
+#else
     MatchResult best;
     if (tW <= 0 || tH <= 0 || iW < tW || iH < tH) return best;
 
@@ -84,6 +104,7 @@ static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int
         }
     }
     return best;
+#endif
 }
 }
 

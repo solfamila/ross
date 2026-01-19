@@ -1,6 +1,11 @@
 #include "detection/panel_finder.h"
 
 #include <algorithm>
+
+#if defined(TM_USE_OPENCV)
+#include <opencv2/imgproc.hpp>
+#include <opencv2/core.hpp>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -93,6 +98,23 @@ struct AnchorMatchResult {
 // Naive NCC (CPU). Intended for downscaled search images and small templates.
 static AnchorMatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int imgW, int imgH,
                                          const std::vector<uint8_t>& tpl, int tplW, int tplH) {
+#if defined(TM_USE_OPENCV)
+    AnchorMatchResult best;
+    if (tplW <= 0 || tplH <= 0 || imgW < tplW || imgH < tplH) return best;
+    cv::Mat imgMat(imgH, imgW, CV_8UC1, (void*)img.data());
+    cv::Mat tplMat(tplH, tplW, CV_8UC1, (void*)tpl.data());
+    cv::Mat res;
+    cv::matchTemplate(imgMat, tplMat, res, cv::TM_CCOEFF_NORMED);
+    double minv, maxv; cv::Point minp, maxp;
+    cv::minMaxLoc(res, &minv, &maxv, &minp, &maxp);
+    best.found = true;
+    best.score = static_cast<float>(maxv);
+    best.x = maxp.x;
+    best.y = maxp.y;
+    best.w = tplW;
+    best.h = tplH;
+    return best;
+#else
     AnchorMatchResult best;
     if (tplW <= 0 || tplH <= 0 || imgW < tplW || imgH < tplH) return best;
 
@@ -150,6 +172,7 @@ static AnchorMatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int i
     }
 
     return best;
+#endif
 }
 
 static AnchorMatchResult findAnchorByTemplate(const std::vector<uint8_t>& imgGray, int imgW, int imgH,
