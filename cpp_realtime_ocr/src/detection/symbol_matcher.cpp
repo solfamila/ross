@@ -48,7 +48,7 @@ static bool loadImageBGRA(const std::string& path, std::vector<uint8_t>& bgra, i
     return true;
 }
 
-struct MatchResult { bool found=false; float score=0; };
+struct MatchResult { bool found=false; float score=0; int x=0; int y=0; };
 static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int iH,
                                     const std::vector<uint8_t>& tpl, int tW, int tH) {
     MatchResult best;
@@ -80,7 +80,12 @@ static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int
             double denom = std::sqrt(varI*varT);
             if (denom <= 1e-6) continue;
             float ncc = (float)(numerator/denom);
-            if (!best.found || ncc > best.score) { best.found = true; best.score = ncc; }
+            if (!best.found || ncc > best.score) {
+                best.found = true;
+                best.score = ncc;
+                best.x = x;
+                best.y = y;
+            }
         }
     }
     return best;
@@ -136,6 +141,32 @@ float SymbolMatcher::matchInGrayROI(const std::vector<uint8_t>& frameGray, int f
         if (m.found) best = std::max(best, m.score);
     }
     return best;
+}
+
+SymbolMatch SymbolMatcher::matchInGrayROIWithLoc(const std::vector<uint8_t>& frameGray, int frameW, int frameH,
+                                                 const ROI& roi) const {
+    SymbolMatch out;
+    if (m_templates.empty()) return out;
+
+    int x = std::max(0, std::min(roi.x, frameW - 1));
+    int y = std::max(0, std::min(roi.y, frameH - 1));
+    int w = std::max(1, std::min(roi.w, frameW - x));
+    int h = std::max(1, std::min(roi.h, frameH - y));
+
+    auto crop = cropGrayRegion(frameGray, frameW, frameH, x, y, w, h);
+    for (const auto& t : m_templates) {
+        auto m = matchTemplateNCC(crop, w, h, t.gray, t.w, t.h);
+        if (!m.found) continue;
+        if (!out.found || m.score > out.score) {
+            out.found = true;
+            out.score = m.score;
+            out.x = x + m.x;
+            out.y = y + m.y;
+            out.w = t.w;
+            out.h = t.h;
+        }
+    }
+    return out;
 }
 
 } // namespace trading_monitor::detect

@@ -61,6 +61,10 @@ struct PanelFinderConfig {
     // Edge-based refinement (heuristic)
     int edgeSearchPad = 24;
     float edgeMinStrength = 12.0f; // row/col gradient energy threshold (tune)
+
+    // Optional: limit which templates to search
+    bool detectOrder = true;
+    bool detectQuote = true;
 };
 
 class PanelFinder {

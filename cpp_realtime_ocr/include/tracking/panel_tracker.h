@@ -12,6 +12,9 @@ struct TrackerConfig {
     float minTrackScore = 0.60f;
     int maxSearchW = 480;          // downscale search width (0=disable)
     int reexpandEveryNFrames = 15; // edge refine cadence (0=disable)
+    std::vector<float> scaleMultipliers = {0.97f, 1.00f, 1.03f};
+    float minScale = 0.60f;
+    float maxScale = 1.40f;
 };
 
 struct HeaderTemplate {
@@ -45,6 +48,7 @@ private:
     ROI m_lastPanel{};
     float m_lastScore = 0.0f;
     uint64_t m_lastExpandedFrame = 0;
+    float m_lastScale = 1.0f;
 };
 
 } // namespace trading_monitor::track

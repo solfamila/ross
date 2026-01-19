@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include <wincodec.h>
 #include <winrt/base.h>
 
 #include "capture/d3d11_capture.h"
@@ -214,6 +215,76 @@ static bool writePGM8(const std::string& path, const std::vector<uint8_t>& data,
     out << "P5\n" << w << " " << h << "\n255\n";
     out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     return out.good();
+}
+
+static bool writePNGGray8(const std::wstring& path, const uint8_t* data, int w, int h) {
+    if (!data || w <= 0 || h <= 0) return false;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comInited = SUCCEEDED(hr);
+    if (hr == RPC_E_CHANGED_MODE) {
+        hr = S_OK;
+    }
+    if (FAILED(hr)) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    IWICStream* stream = nullptr;
+
+    bool ok = false;
+    do {
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) break;
+
+        hr = factory->CreateStream(&stream);
+        if (FAILED(hr)) break;
+
+        hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) break;
+
+        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        if (FAILED(hr)) break;
+
+        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+        if (FAILED(hr)) break;
+
+        hr = encoder->CreateNewFrame(&frame, &props);
+        if (FAILED(hr)) break;
+
+        hr = frame->Initialize(props);
+        if (FAILED(hr)) break;
+
+        hr = frame->SetSize(static_cast<UINT>(w), static_cast<UINT>(h));
+        if (FAILED(hr)) break;
+
+        WICPixelFormatGUID format = GUID_WICPixelFormat8bppGray;
+        hr = frame->SetPixelFormat(&format);
+        if (FAILED(hr)) break;
+
+        const UINT stride = static_cast<UINT>(w);
+        const UINT bufSize = stride * static_cast<UINT>(h);
+        hr = frame->WritePixels(static_cast<UINT>(h), stride, bufSize, const_cast<BYTE*>(data));
+        if (FAILED(hr)) break;
+
+        hr = frame->Commit();
+        if (FAILED(hr)) break;
+        hr = encoder->Commit();
+        if (FAILED(hr)) break;
+
+        ok = true;
+    } while (false);
+
+    if (frame) frame->Release();
+    if (props) props->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    if (comInited) CoUninitialize();
+
+    return ok;
 }
 
 static void printWindowsList(const std::vector<std::pair<void*, std::string>>& windows) {
@@ -1058,6 +1129,30 @@ int main(int argc, char* argv[]) {
         trading_monitor::track::TrackerConfig trackCfg;
         trading_monitor::Profiler profiler(enableProfile);
         uint64_t lastTrigBuildFrame = 0;
+        float bestChange = -1.0f;
+        uint64_t bestChangeFrame = 0;
+        double bestChangeTimeMs = 0.0;
+        trading_monitor::ROI bestChangeRoi{};
+        std::vector<uint8_t> bestChangeFrameGray;
+        std::vector<uint8_t> bestChangeNextGray;
+        bool captureNext = false;
+        float bestSymFullScore = -1.0f;
+        uint64_t bestSymFullFrame = 0;
+        trading_monitor::ROI bestSymBand{};
+        const int symLocateEveryN = 1;
+        const float symPresentThresh = 0.45f;
+        const int symConfirmFrames = 2;
+        int symPresentCount = 0;
+        uint64_t symPresentFirstFrame = 0;
+        uint64_t symEventFrame = 0;
+        bool symEventSet = false;
+        float bestCoarseChange = -1.0f;
+        uint64_t bestCoarseFrame = 0;
+        double bestCoarseTimeMs = 0.0;
+        bool havePrevCoarse = false;
+        std::vector<uint8_t> prevTrigCoarse;
+        int prevTrigCoarseW = 0;
+        int prevTrigCoarseH = 0;
 
         trading_monitor::track::HeaderTemplate hdrTpl;
         if (entryTriggerMode) {
@@ -1104,7 +1199,17 @@ int main(int argc, char* argv[]) {
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
 
+                // Make search cheaper during bring-up
+                panelCfg.maxSearchW = 320.0f;
+                panelCfg.scales = {0.90f, 1.00f, 1.10f};
+                panelCfg.hdrThreshold = 0.30f;
+                panelCfg.detectOrder = false;
+                panelCfg.detectQuote = false;
+                trackCfg.minTrackScore = 0.40f;
+                trackCfg.scaleMultipliers = {0.97f, 1.00f, 1.03f};
+
                 float trigScore = -1.0f;
+                float trackScore = -1.0f;
 
                 // Y plane -> tight grayscale buffer
                 std::vector<uint8_t> gray(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height));
@@ -1113,29 +1218,109 @@ int main(int argc, char* argv[]) {
                     uint8_t* dstRow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.width);
                     std::memcpy(dstRow, srcRow, static_cast<size_t>(frame.width));
                 }
+                static bool dumpedFrame = false;
+                if (!dumpedFrame) {
+                    const std::wstring framePath = L"debug_frame0.png";
+                    if (writePNGGray8(framePath, gray.data(), frame.width, frame.height)) {
+                        std::wcerr << L"Wrote " << framePath << L"\n";
+                        dumpedFrame = true;
+                    }
+                }
                 profiler.markGray();
 
                 // Acquire positions panel (once) or re-acquire if tracking fails
                 static bool havePanel = false;
                 static trading_monitor::detect::FoundPanels found{};
+                static int trackFailCount = 0;
+
+                const auto printProgress = [&]() {
+                    if (frame.frameIndex < 60) {
+                        std::cout
+                            << "frame=" << frame.frameIndex
+                            << " pts=" << frame.pts100ns
+                            << " havePanel=" << (havePanel ? "1" : "0")
+                            << " trigOk=" << (trigRoi.ok ? "1" : "0")
+                            << " trigScore=" << std::fixed << std::setprecision(3) << trigScore
+                            << " trackScore=" << std::fixed << std::setprecision(3) << trackScore
+                            << "\n";
+                    }
+                };
 
                 if (!havePanel) {
-                    found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    std::cerr << ">>> panel find start frame=" << frame.frameIndex << "\n" << std::flush;
+
+                    // Search only left half to cut work in half.
+                    const int leftW = (std::max)(1, frame.width / 2);
+                    std::vector<uint8_t> grayLeft(static_cast<size_t>(leftW) * static_cast<size_t>(frame.height));
+                    for (int y = 0; y < frame.height; ++y) {
+                        const uint8_t* srcRow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.width);
+                        uint8_t* dstRow = grayLeft.data() + static_cast<size_t>(y) * static_cast<size_t>(leftW);
+                        std::memcpy(dstRow, srcRow, static_cast<size_t>(leftW));
+                    }
+
+                    found = panelFinder.findPanelsFromGray(grayLeft.data(), leftW, frame.height, panelCfg);
+
+                    if (!found.hasPositions) {
+                        // Fallback: try full frame once
+                        found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
+                    }
+
+                    // One-time dump of matched header region to PNG for inspection.
+                    static bool dumpedHeader = false;
+                    if (!dumpedHeader && found.positionsHeader.w > 0 && found.positionsHeader.h > 0) {
+                        const int hx = (std::max)(0, found.positionsHeader.x);
+                        const int hy = (std::max)(0, found.positionsHeader.y);
+                        const int hw = (std::min)(found.positionsHeader.w, frame.width - hx);
+                        const int hh = (std::min)(found.positionsHeader.h, frame.height - hy);
+                        if (hw > 0 && hh > 0) {
+                            std::vector<uint8_t> crop(static_cast<size_t>(hw) * static_cast<size_t>(hh));
+                            for (int y = 0; y < hh; ++y) {
+                                const uint8_t* srcRow = gray.data() + static_cast<size_t>(hy + y) * static_cast<size_t>(frame.width) + static_cast<size_t>(hx);
+                                uint8_t* dstRow = crop.data() + static_cast<size_t>(y) * static_cast<size_t>(hw);
+                                std::memcpy(dstRow, srcRow, static_cast<size_t>(hw));
+                            }
+                            const std::wstring outPath = L"debug_header_match.png";
+                            if (writePNGGray8(outPath, crop.data(), hw, hh)) {
+                                std::wcerr << L"Wrote " << outPath << L"\n";
+                                dumpedHeader = true;
+                            }
+                        }
+                    }
+
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    std::cerr << "<<< panel find done ms="
+                              << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                              << " hasPositions=" << (found.hasPositions ? "1" : "0")
+                              << " score=" << std::fixed << std::setprecision(3) << found.scorePositions
+                              << " bestXYWH=" << found.positionsHeader.x << "," << found.positionsHeader.y
+                              << "," << found.positionsHeader.w << "," << found.positionsHeader.h
+                              << "\n" << std::flush;
+
                     profiler.markFind();
                     if (!found.hasPositions) {
+                        printProgress();
                         profiler.endFrame();
                         continue;
                     }
                     tracker.init(hdrTpl, found.positionsHeader, found.positionsPanel);
+                    trackFailCount = 0;
                     havePanel = true;
                 } else {
                     auto tr = tracker.update(gray, frame.width, frame.height, trackCfg, frame.frameIndex, true);
                     profiler.markTrack();
+                    trackScore = tr.score;
                     if (!tr.ok) {
-                        havePanel = false;
+                        trackFailCount++;
+                        if (trackFailCount >= 3) {
+                            havePanel = false;
+                            trackFailCount = 0;
+                        }
+                        printProgress();
                         profiler.endFrame();
                         continue;
                     }
+                    trackFailCount = 0;
                     found.positionsPanel = tr.panelRect;
                     found.positionsHeader = tr.headerRect;
                 }
@@ -1147,13 +1332,73 @@ int main(int argc, char* argv[]) {
                     profiler.markRoiBuild();
                 }
                 if (!trigRoi.ok) {
+                    printProgress();
                     profiler.endFrame();
                     continue;
                 }
 
-                // Match target symbol in trigger ROI
-                trigScore = sym.matchInGrayROI(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                // Coarse change-peak on trigger ROI (always on)
+                {
+                    const trading_monitor::ROI changeRoi = trigRoi.triggerRoi;
+                    const int rx = (std::max)(0, (std::min)(changeRoi.x, frame.width - 1));
+                    const int ry = (std::max)(0, (std::min)(changeRoi.y, frame.height - 1));
+                    const int rw = (std::max)(1, (std::min)(changeRoi.w, frame.width - rx));
+                    const int rh = (std::max)(1, (std::min)(changeRoi.h, frame.height - ry));
+                    std::vector<uint8_t> trigCrop((size_t)rw * (size_t)rh);
+                    for (int y = 0; y < rh; ++y) {
+                        const uint8_t* srcRow = gray.data() + (size_t)(ry + y) * (size_t)frame.width + (size_t)rx;
+                        uint8_t* dstRow = trigCrop.data() + (size_t)y * (size_t)rw;
+                        std::memcpy(dstRow, srcRow, (size_t)rw);
+                    }
+                    if (havePrevCoarse && prevTrigCoarseW == rw && prevTrigCoarseH == rh) {
+                        double sum = 0.0;
+                        for (size_t i = 0; i < trigCrop.size(); ++i) {
+                            sum += std::abs((int)trigCrop[i] - (int)prevTrigCoarse[i]);
+                        }
+                        const float ch = (float)(sum / (double)trigCrop.size());
+                        if (ch > bestCoarseChange) {
+                            bestCoarseChange = ch;
+                            bestCoarseFrame = frame.frameIndex;
+                            bestCoarseTimeMs = frameTimeMs;
+                        }
+                    }
+                    prevTrigCoarse = std::move(trigCrop);
+                    prevTrigCoarseW = rw;
+                    prevTrigCoarseH = rh;
+                    havePrevCoarse = true;
+                }
+
+                // Match target symbol in trigger ROI (with location)
+                const auto symLocTrig = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                trigScore = symLocTrig.found ? symLocTrig.score : -1.0f;
                 profiler.markMatch(trigScore);
+
+                if (trigScore >= symPresentThresh) {
+                    symPresentCount++;
+                    if (symPresentCount == 1) {
+                        symPresentFirstFrame = frame.frameIndex;
+                    }
+                    if (symPresentCount >= symConfirmFrames && !symEventSet) {
+                        symEventSet = true;
+                        symEventFrame = symPresentFirstFrame;
+                    }
+                } else {
+                    symPresentCount = 0;
+                }
+
+                // Track best symbol band using trigger ROI localization
+                if ((frame.frameIndex % (uint64_t)symLocateEveryN) == 0) {
+                    if (symLocTrig.found && symLocTrig.score > bestSymFullScore) {
+                        bestSymFullScore = symLocTrig.score;
+                        bestSymFullFrame = frame.frameIndex;
+                        bestSymBand = trading_monitor::ROI{"sym_band",
+                            (std::max)(0, symLocTrig.x - 10),
+                            (std::max)(0, symLocTrig.y - 4),
+                            (std::min)(260, frame.width - (std::max)(0, symLocTrig.x - 10)),
+                            (std::min)(40, frame.height - (std::max)(0, symLocTrig.y - 4))
+                        };
+                    }
+                }
 
                 auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
                 profiler.markState(entry.state().armed, entry.state().triggered);
@@ -1223,6 +1468,130 @@ int main(int argc, char* argv[]) {
 
         if (entryTriggerMode) {
             profiler.flush(profileJsonPath, profileSummaryPath);
+
+            const uint64_t targetFrame = (bestCoarseFrame > 0) ? bestCoarseFrame
+                : (symEventSet ? symEventFrame : bestSymFullFrame);
+
+            // Second pass: refine change-peak in a window around target symbol frame
+            if (targetFrame > 0) {
+                const int win = 30;
+                const int start = (targetFrame > (uint64_t)win) ? (int)(targetFrame - win) : 0;
+                const int end = (int)(std::min<uint64_t>(count - 1, targetFrame + win));
+
+                trading_monitor::video::MFSourceReaderDecoder dec2;
+                std::string err2;
+                if (dec2.open(fs::path(resolved).wstring(), err2)) {
+                    trading_monitor::video::VideoFrameY fr2;
+                    std::vector<uint8_t> prevGray;
+                    bool havePrev = false;
+                    bestChange = -1.0f;
+                    bestChangeFrame = 0;
+                    bestChangeTimeMs = 0.0;
+                    bestChangeFrameGray.clear();
+                    bestChangeNextGray.clear();
+                    captureNext = false;
+
+                    trading_monitor::ROI band{};
+                    bool bandReady = false;
+
+                    while (dec2.readFrame(fr2, err2)) {
+                        const int idx = (int)fr2.frameIndex;
+                        if (idx < start) {
+                            continue;
+                        }
+                        if (idx > end) {
+                            break;
+                        }
+
+                        std::vector<uint8_t> gray2(static_cast<size_t>(fr2.width) * static_cast<size_t>(fr2.height));
+                        for (int y = 0; y < fr2.height; ++y) {
+                            const uint8_t* srcRow = fr2.y.data() + static_cast<size_t>(y) * static_cast<size_t>(fr2.strideY);
+                            uint8_t* dstRow = gray2.data() + static_cast<size_t>(y) * static_cast<size_t>(fr2.width);
+                            std::memcpy(dstRow, srcRow, static_cast<size_t>(fr2.width));
+                        }
+
+                        if (!bandReady && idx == (int)targetFrame) {
+                            const auto found2 = panelFinder.findPanelsFromGray(gray2.data(), fr2.width, fr2.height, panelCfg);
+                            if (found2.hasPositions && found2.positionsPanel.w > 0 && found2.positionsPanel.h > 0) {
+                                auto trig2 = trigBuilder.build(gray2, fr2.width, fr2.height, found2.positionsPanel, trigCfg);
+                                if (trig2.ok) {
+                                    auto symLoc = sym.matchInGrayROIWithLoc(gray2, fr2.width, fr2.height, trig2.triggerRoi);
+                                    if (symLoc.found) {
+                                        band = trading_monitor::ROI{"sym_band",
+                                            (std::max)(0, symLoc.x - 10),
+                                            (std::max)(0, symLoc.y - 4),
+                                            (std::min)(260, fr2.width - (std::max)(0, symLoc.x - 10)),
+                                            (std::min)(40, fr2.height - (std::max)(0, symLoc.y - 4))
+                                        };
+                                        bandReady = true;
+                                        bestSymBand = band;
+                                    }
+                                }
+                            }
+
+                            if (!bandReady && bestSymBand.w > 0 && bestSymBand.h > 0) {
+                                band = bestSymBand;
+                                bandReady = true;
+                            }
+                        }
+
+                        if (havePrev && bandReady) {
+                            const int rx = (std::max)(0, (std::min)(band.x, fr2.width - 1));
+                            const int ry = (std::max)(0, (std::min)(band.y, fr2.height - 1));
+                            const int rw = (std::max)(1, (std::min)(band.w, fr2.width - rx));
+                            const int rh = (std::max)(1, (std::min)(band.h, fr2.height - ry));
+
+                            double sum = 0.0;
+                            const size_t rowStride = static_cast<size_t>(fr2.width);
+                            for (int y = 0; y < rh; ++y) {
+                                const uint8_t* rowNow = gray2.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
+                                const uint8_t* rowPrev = prevGray.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
+                                for (int x = 0; x < rw; ++x) {
+                                    sum += std::abs((int)rowNow[x] - (int)rowPrev[x]);
+                                }
+                            }
+                            const float ch = (float)(sum / (double)(rw * rh));
+                            if (ch > bestChange) {
+                                bestChange = ch;
+                                bestChangeFrame = fr2.frameIndex;
+                                if (dec2.fps() > 0.0) {
+                                    bestChangeTimeMs = 1000.0 * (double)fr2.frameIndex / dec2.fps();
+                                } else {
+                                    bestChangeTimeMs = (double)fr2.pts100ns / 10000.0;
+                                }
+                                bestChangeRoi = band;
+                                bestChangeFrameGray = gray2;
+                                bestChangeNextGray.clear();
+                                captureNext = true;
+                            }
+                        }
+
+                        if (captureNext && fr2.frameIndex == bestChangeFrame + 1) {
+                            bestChangeNextGray = gray2;
+                            captureNext = false;
+                        }
+
+                        prevGray = std::move(gray2);
+                        havePrev = true;
+                    }
+                }
+            }
+
+            if (bestChangeFrame > 0 && bestChangeRoi.w > 0 && bestChangeRoi.h > 0) {
+                const auto& useGray = !bestChangeNextGray.empty() ? bestChangeNextGray : bestChangeFrameGray;
+                float scoreAtChange = -1.0f;
+                if (!useGray.empty()) {
+                    scoreAtChange = sym.matchInGrayROI(useGray, frame.width, frame.height, bestChangeRoi);
+                }
+                const double absentMs = (dec.fps() > 0.0) ? (1000.0 * (double)(bestChangeFrame - 1) / dec.fps())
+                                                        : (bestChangeTimeMs - (1000.0 / 30.0));
+                std::cout << "\n[entry-change] " << targetSymbol
+                          << " window_ms=(" << std::fixed << std::setprecision(2)
+                          << absentMs << "," << bestChangeTimeMs << "]"
+                          << " change=" << std::fixed << std::setprecision(3) << bestChange
+                          << " score=" << std::fixed << std::setprecision(3) << scoreAtChange
+                          << " frame=" << bestChangeFrame << "\n";
+            }
         }
 
         const auto t1 = std::chrono::steady_clock::now();
@@ -2686,12 +3055,14 @@ int main(int argc, char* argv[]) {
                 cudaMemcpy(h_output.data(), d_probs, h_output.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
                 CTCResult res = decoder.decode(h_output.data(), timesteps, numClasses, 0);
-                std::string numeric = filterNumericLike(res.text);
+                const std::string ticker = extractTickerLike(res.text);
+                const std::string numeric = filterNumericLike(res.text);
 
                 std::lock_guard<std::mutex> lock(printMutex);
                 std::cout << "[frame " << frame.frameNumber << "] "
-                          << cfg.rois[idx].name << ": "
-                          << numeric;
+                          << roiClient.name << ": "
+                          << (ticker.empty() ? std::string("(no ticker)") : ticker)
+                          << "  " << numeric;
                 if (verbose) {
                     std::cout << " (raw='" << res.text << "', conf=" << res.confidence << ")";
                 }

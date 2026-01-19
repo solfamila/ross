@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 
 #include "utils/stb_image.h" // stbi_load via WIC-backed implementation
 
@@ -316,31 +317,33 @@ static FoundPanels findPanelsFromGrayImpl(const uint8_t* grayPtr, int w, int h,
     if (!tpl.positionsHdr.empty()) {
         auto m = findAnchorByTemplate(gray, w, h, tpl.positionsHdr, tpl.positionsW, tpl.positionsH,
                                       cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        out.scorePositions = m.score;
+        if (m.w > 0 && m.h > 0) {
+            out.positionsHeader = clampROI(ROI{"positions_header", m.x, m.y, m.w, m.h}, w, h);
+        }
         if (m.found) {
             out.hasPositions = true;
-            out.scorePositions = m.score;
-            out.positionsHeader = clampROI(ROI{"positions_header", m.x, m.y, m.w, m.h}, w, h);
             out.positionsPanel = expandHeaderToPanelEdges(out.positionsHeader, gray, w, h, cfg, "positions_panel");
         }
     }
 
-    if (!tpl.orderHdr.empty()) {
+    if (cfg.detectOrder && !tpl.orderHdr.empty()) {
         auto m = findAnchorByTemplate(gray, w, h, tpl.orderHdr, tpl.orderW, tpl.orderH,
                                       cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        out.scoreOrder = m.score;
         if (m.found) {
             out.hasOrder = true;
-            out.scoreOrder = m.score;
             out.orderHeader = clampROI(ROI{"order_header", m.x, m.y, m.w, m.h}, w, h);
             out.orderPanel = expandHeaderToPanelEdges(out.orderHeader, gray, w, h, cfg, "order_panel");
         }
     }
 
-    if (!tpl.quoteHdr.empty()) {
+    if (cfg.detectQuote && !tpl.quoteHdr.empty()) {
         auto m = findAnchorByTemplate(gray, w, h, tpl.quoteHdr, tpl.quoteW, tpl.quoteH,
                                       cfg.scales, cfg.hdrThreshold, cfg.maxSearchW);
+        out.scoreQuote = m.score;
         if (m.found) {
             out.hasQuote = true;
-            out.scoreQuote = m.score;
             out.quoteHeader = clampROI(ROI{"quote_header", m.x, m.y, m.w, m.h}, w, h);
             out.quotePanel = expandHeaderToPanelEdges(out.quoteHeader, gray, w, h, cfg, "quote_panel");
         }
@@ -362,14 +365,14 @@ bool PanelFinder::loadTemplates(const std::string& positionsHdrPath,
         return false;
     }
 
-    if (!orderHdrPath.empty()) {
+    if (!orderHdrPath.empty() && std::filesystem::exists(orderHdrPath)) {
         if (!loadTemplateGray(orderHdrPath, m_tpl.orderHdr, m_tpl.orderW, m_tpl.orderH)) {
             err = "Failed to load order entry header template: " + orderHdrPath;
             return false;
         }
     }
 
-    if (!quoteHdrPath.empty()) {
+    if (!quoteHdrPath.empty() && std::filesystem::exists(quoteHdrPath)) {
         if (!loadTemplateGray(quoteHdrPath, m_tpl.quoteHdr, m_tpl.quoteW, m_tpl.quoteH)) {
             err = "Failed to load stock quote header template: " + quoteHdrPath;
             return false;

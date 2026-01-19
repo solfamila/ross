@@ -96,6 +96,7 @@ void PanelTracker::init(const HeaderTemplate& headerTpl, const ROI& initialHeade
     m_lastScore = 1.0f;
     m_inited = (!m_tpl.gray.empty() && m_tpl.w > 0 && m_tpl.h > 0);
     m_lastExpandedFrame = 0;
+    m_lastScale = 1.0f;
 }
 
 TrackResult PanelTracker::update(const std::vector<uint8_t>& frameGray, int frameW, int frameH,
@@ -115,33 +116,62 @@ TrackResult PanelTracker::update(const std::vector<uint8_t>& frameGray, int fram
     std::vector<uint8_t> searchGray = cropGrayRegion(frameGray, frameW, frameH, search.x, search.y, search.w, search.h);
     int sW = search.w, sH = search.h;
 
-    float scale = 1.0f;
+    float searchScale = 1.0f;
     if (cfg.maxSearchW > 0 && sW > cfg.maxSearchW) {
-        scale = (float)cfg.maxSearchW / (float)sW;
-        int dsW = std::max(8, (int)std::lround(sW*scale));
-        int dsH = std::max(8, (int)std::lround(sH*scale));
+        searchScale = (float)cfg.maxSearchW / (float)sW;
+        int dsW = std::max(8, (int)std::lround(sW*searchScale));
+        int dsH = std::max(8, (int)std::lround(sH*searchScale));
         searchGray = resizeGrayNearest(searchGray, sW, sH, dsW, dsH);
         sW = dsW; sH = dsH;
     }
 
-    MatchResult m = matchTemplateNCC(searchGray, sW, sH, m_tpl.gray, m_tpl.w, m_tpl.h);
-    if (!m.found || m.score < cfg.minTrackScore) {
+    MatchResult best;
+    float bestScale = m_lastScale;
+    int bestTplW = m_tpl.w;
+    int bestTplH = m_tpl.h;
+    if (cfg.scaleMultipliers.empty()) {
+        best = matchTemplateNCC(searchGray, sW, sH, m_tpl.gray, m_tpl.w, m_tpl.h);
+    } else {
+        for (float mult : cfg.scaleMultipliers) {
+            float s = std::max(cfg.minScale, std::min(cfg.maxScale, m_lastScale * mult));
+            int tW = std::max(8, (int)std::lround(m_tpl.w * s * searchScale));
+            int tH = std::max(8, (int)std::lround(m_tpl.h * s * searchScale));
+            if (tW >= sW || tH >= sH) continue;
+            std::vector<uint8_t> tplScaled = resizeGrayNearest(m_tpl.gray, m_tpl.w, m_tpl.h, tW, tH);
+            MatchResult m = matchTemplateNCC(searchGray, sW, sH, tplScaled, tW, tH);
+            if (!best.found || m.score > best.score) {
+                best = m;
+                bestScale = s;
+                bestTplW = tW;
+                bestTplH = tH;
+            }
+        }
+    }
+
+    if (!best.found || best.score < cfg.minTrackScore) {
         out.ok = false;
-        out.score = m.found ? m.score : -1.0f;
+        out.score = best.found ? best.score : -1.0f;
         return out;
     }
 
-    int mx = m.x, my = m.y;
-    if (scale != 1.0f) {
-        mx = (int)std::lround(mx / scale);
-        my = (int)std::lround(my / scale);
+    int mx = best.x, my = best.y;
+    if (searchScale != 1.0f) {
+        mx = (int)std::lround(mx / searchScale);
+        my = (int)std::lround(my / searchScale);
+    }
+
+    int headerW = bestTplW;
+    int headerH = bestTplH;
+    if (searchScale != 1.0f) {
+        headerW = (int)std::lround(bestTplW / searchScale);
+        headerH = (int)std::lround(bestTplH / searchScale);
     }
 
     ROI newHeader = m_lastHeader;
     newHeader.x = search.x + mx;
     newHeader.y = search.y + my;
-    newHeader.w = m_tpl.w;
-    newHeader.h = m_tpl.h;
+    newHeader.w = headerW;
+    newHeader.h = headerH;
     newHeader = clampROI(newHeader, frameW, frameH);
 
     int dx = newHeader.x - m_lastHeader.x;
@@ -165,10 +195,11 @@ TrackResult PanelTracker::update(const std::vector<uint8_t>& frameGray, int fram
 
     m_lastHeader = newHeader;
     m_lastPanel = newPanel;
-    m_lastScore = m.score;
+    m_lastScore = best.score;
+    m_lastScale = bestScale;
 
     out.ok = true;
-    out.score = m.score;
+    out.score = best.score;
     out.headerRect = newHeader;
     out.panelRect = newPanel;
     return out;

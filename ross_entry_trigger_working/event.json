@@ -1,0 +1,21 @@
+{
+  "video": "C:\\Users\\forfr\\Downloads\\trade\\trade1_first_10s.mp4",
+  "fps": 30.0,
+  "event": {
+    "target": "APVO",
+    "method": "change_peak_ocr",
+    "absent_last_frame": 161,
+    "present_first_frame": 162,
+    "absent_last_time_ms": 5366.666666666667,
+    "present_first_time_ms": 5400.0,
+    "window_ms": [
+      5366.666666666667,
+      5400.0
+    ],
+    "best_change": 4.85375,
+    "best_symbol_score": 0.5175784230232239,
+    "best_symbol_frame": 170,
+    "ocr_text": "APVO",
+    "ocr_score": 0.9997610449790955
+  }
+}

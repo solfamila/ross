@@ -1,0 +1,25 @@
+{
+  "target": "APVO",
+  "video": "C:\\Users\\forfr\\Downloads\\trade\\trade1_first_10s.mp4",
+  "fps": 30.0,
+  "event": {
+    "absent_last_frame": 0,
+    "absent_last_time_ms": 0.0,
+    "present_first_frame": 0,
+    "present_first_time_ms": 0.0,
+    "window_ms": [
+      0.0,
+      0.0
+    ]
+  },
+  "thresholds": {
+    "header": 0.3,
+    "symbol": 0.5
+  },
+  "templates": {
+    "header": "C:\\Users\\forfr\\Downloads\\trade\\templates_auto\\headers\\positions_hdr.png",
+    "symbols": [
+      "C:\\Users\\forfr\\Downloads\\trade\\templates_auto\\symbols\\APVO_0.png"
+    ]
+  }
+}
