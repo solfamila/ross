@@ -811,6 +811,7 @@ int main(int argc, char* argv[]) {
     std::string targetSymbol;
     double delayCompMs = 0.0;
     bool enableProfile = false;
+    bool trackHeaderMode = false;
     std::string profileJsonPath;
     std::string profileSummaryPath;
 
@@ -891,6 +892,8 @@ int main(int argc, char* argv[]) {
             delayCompMs = std::stod(argv[++i]);
         } else if (arg == "--profile") {
             enableProfile = true;
+        } else if (arg == "--track-header") {
+            trackHeaderMode = true;
         } else if (arg == "--profile-output" && i + 1 < argc) {
             profileJsonPath = argv[++i];
         } else if (arg == "--profile-summary" && i + 1 < argc) {
@@ -1143,9 +1146,11 @@ int main(int argc, char* argv[]) {
         bool captureNext = false;
         float bestSymFullScore = -1.0f;
         uint64_t bestSymFullFrame = 0;
+        float bestSymTrigScore = -1.0f;
+        uint64_t bestSymTrigFrame = 0;
         trading_monitor::ROI bestSymBand{};
         const int symLocateEveryN = 1;
-        const float symPresentThresh = 0.45f;
+        const float symPresentThresh = 0.60f;
         const int symConfirmFrames = 2;
         int symPresentCount = 0;
         uint64_t symPresentFirstFrame = 0;
@@ -1158,6 +1163,7 @@ int main(int argc, char* argv[]) {
         std::vector<uint8_t> prevTrigCoarse;
         int prevTrigCoarseW = 0;
         int prevTrigCoarseH = 0;
+        bool usedFullFrameSym = false;
 
         trading_monitor::track::HeaderTemplate hdrTpl;
         if (entryTriggerMode) {
@@ -1205,12 +1211,12 @@ int main(int argc, char* argv[]) {
                 profiler.beginFrame(frame.frameIndex);
 
                 // Match Python header search parameters
-                panelCfg.maxSearchW = static_cast<float>(frame.width) * 0.70f;
+                panelCfg.maxSearchW = 0.0f;
                 panelCfg.scales = {0.80f, 0.90f, 1.00f, 1.10f};
                 panelCfg.hdrThreshold = 0.55f;
                 panelCfg.detectOrder = false;
                 panelCfg.detectQuote = false;
-                trackCfg.minTrackScore = 0.40f;
+                trackCfg.minTrackScore = (std::max)(0.40f, panelCfg.hdrThreshold - 0.05f);
                 trackCfg.scaleMultipliers = {0.97f, 1.00f, 1.03f};
 
                 float trigScore = -1.0f;
@@ -1237,6 +1243,8 @@ int main(int argc, char* argv[]) {
                 static bool havePanel = false;
                 static trading_monitor::detect::FoundPanels found{};
                 static int trackFailCount = 0;
+                static int trackAge = 0;
+                const int trackReacquireEvery = 0;
 
                 const auto printProgress = [&]() {
                     if (frame.frameIndex < 60) {
@@ -1276,24 +1284,30 @@ int main(int argc, char* argv[]) {
                             if (a > bestArea) { bestArea = a; bestIdx = i; }
                         }
                         cv::Rect r = cv::boundingRect(contours[bestIdx]);
-                        streamRoi.x = r.x;
-                        streamRoi.y = r.y;
-                        streamRoi.w = r.width;
-                        streamRoi.h = r.height;
+                        const double area = (double)r.width * (double)r.height;
+                        if (area >= 0.20 * (double)W * (double)H) {
+                            streamRoi.x = r.x;
+                            streamRoi.y = r.y;
+                            streamRoi.w = r.width;
+                            streamRoi.h = r.height;
+                        }
                     }
 #endif
                     streamRoi = clampROIToFrame(streamRoi, W, H);
+                    std::cout << "[entry-debug] streamRoi=" << streamRoi.x << "," << streamRoi.y
+                              << "," << streamRoi.w << "," << streamRoi.h << "\n";
                     streamRoiInit = true;
                 }
 
-                if (!havePanel) {
+                const bool needReacquire = trackHeaderMode && trackReacquireEvery > 0 && trackAge >= trackReacquireEvery;
+                if (!trackHeaderMode || !havePanel || needReacquire) {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     std::cerr << ">>> panel find start frame=" << frame.frameIndex << "\n" << std::flush;
 
                     // Search within stream ROI (left 70% region by default)
                     const int sx = streamRoi.x;
                     const int sy = streamRoi.y;
-                    const int sw = streamRoi.w;
+                    const int sw = (int)std::lround(streamRoi.w * 0.70);
                     const int sh = streamRoi.h;
                     std::vector<uint8_t> graySearch((size_t)sw * (size_t)sh);
                     for (int y = 0; y < sh; ++y) {
@@ -1343,13 +1357,32 @@ int main(int argc, char* argv[]) {
 
                     profiler.markFind();
                     if (!found.hasPositions) {
+                        // Full-frame symbol match (left half) only when header is missing (Python behavior)
+                        if (!targetSymbol.empty()) {
+                            trading_monitor::ROI leftRoi{"left", 0, 0, (int)std::lround(frame.width * 0.50), frame.height};
+                            auto m = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, leftRoi);
+                            if (m.found && m.score > bestSymFullScore) {
+                                bestSymFullScore = m.score;
+                                bestSymFullFrame = frame.frameIndex;
+                                usedFullFrameSym = true;
+                            }
+                        }
+                        havePrevCoarse = false;
+                        symPresentCount = 0;
+                        trackAge = 0;
+                        havePanel = false;
                         printProgress();
                         profiler.endFrame();
                         continue;
                     }
-                    tracker.init(hdrTpl, found.positionsHeader, found.positionsPanel);
-                    trackFailCount = 0;
-                    havePanel = true;
+                    if (trackHeaderMode) {
+                        tracker.init(hdrTpl, found.positionsHeader, found.positionsPanel);
+                        trackFailCount = 0;
+                        havePanel = true;
+                        trackAge = 0;
+                    } else {
+                        havePanel = true;
+                    }
                 } else {
                     auto tr = tracker.update(gray, frame.width, frame.height, trackCfg, frame.frameIndex, true);
                     profiler.markTrack();
@@ -1360,6 +1393,9 @@ int main(int argc, char* argv[]) {
                             havePanel = false;
                             trackFailCount = 0;
                         }
+                        havePrevCoarse = false;
+                        symPresentCount = 0;
+                        trackAge = 0;
                         printProgress();
                         profiler.endFrame();
                         continue;
@@ -1367,6 +1403,7 @@ int main(int argc, char* argv[]) {
                     trackFailCount = 0;
                     found.positionsPanel = tr.panelRect;
                     found.positionsHeader = tr.headerRect;
+                    trackAge++;
                 }
 
                 // Build trigger ROI (match Python: fixed box under header)
@@ -1412,6 +1449,10 @@ int main(int argc, char* argv[]) {
                             bestCoarseChange = ch;
                             bestCoarseFrame = frame.frameIndex;
                             bestCoarseTimeMs = frameTimeMs;
+                            bestChange = ch;
+                            bestChangeFrame = frame.frameIndex;
+                            bestChangeTimeMs = frameTimeMs;
+                            bestChangeRoi = changeRoi;
                         }
                     }
                     prevTrigCoarse = std::move(trigCrop);
@@ -1440,7 +1481,7 @@ int main(int argc, char* argv[]) {
 
                 // Track best symbol band using trigger ROI localization
                 if ((frame.frameIndex % (uint64_t)symLocateEveryN) == 0) {
-                    if (symLocTrig.found && symLocTrig.score > bestSymFullScore) {
+                    if (!usedFullFrameSym && symLocTrig.found && symLocTrig.score > bestSymFullScore) {
                         bestSymFullScore = symLocTrig.score;
                         bestSymFullFrame = frame.frameIndex;
                         bestSymBand = trading_monitor::ROI{"sym_band",
@@ -1450,6 +1491,10 @@ int main(int argc, char* argv[]) {
                             (std::min)(40, frame.height - (std::max)(0, symLocTrig.y - 4))
                         };
                     }
+                }
+                if (symLocTrig.found && symLocTrig.score > bestSymTrigScore) {
+                    bestSymTrigScore = symLocTrig.score;
+                    bestSymTrigFrame = frame.frameIndex;
                 }
 
                 auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
@@ -1521,8 +1566,11 @@ int main(int argc, char* argv[]) {
         if (entryTriggerMode) {
             profiler.flush(profileJsonPath, profileSummaryPath);
 
-            // Full-frame symbol search across all frames (Python-like stabilization)
-            if (!targetSymbol.empty()) {
+            // Prefer trigger-ROI symbol peak; fallback to full-frame search if missing
+            if (!usedFullFrameSym && bestSymTrigFrame > 0) {
+                bestSymFullFrame = bestSymTrigFrame;
+                bestSymFullScore = bestSymTrigScore;
+            } else if (!usedFullFrameSym && trackHeaderMode && !targetSymbol.empty()) {
                 trading_monitor::video::MFSourceReaderDecoder decFull;
                 std::string errFull;
                 if (decFull.open(fs::path(resolved).wstring(), errFull)) {
@@ -1536,7 +1584,7 @@ int main(int argc, char* argv[]) {
                             uint8_t* dstRow = grayF.data() + static_cast<size_t>(y) * static_cast<size_t>(frFull.width);
                             std::memcpy(dstRow, srcRow, static_cast<size_t>(frFull.width));
                         }
-                        trading_monitor::ROI leftRoi{"left", 0, 0, (int)std::lround(frFull.width * 0.70), frFull.height};
+                        trading_monitor::ROI leftRoi{"left", 0, 0, (int)std::lround(frFull.width * 0.50), frFull.height};
                         auto m = sym.matchInGrayROIWithLoc(grayF, frFull.width, frFull.height, leftRoi);
                         if (m.found && m.score > bestFullScore) {
                             bestFullScore = m.score;
@@ -1546,11 +1594,12 @@ int main(int argc, char* argv[]) {
                     if (bestFullFrame > 0) {
                         bestSymFullFrame = bestFullFrame;
                         bestSymFullScore = bestFullScore;
+                        usedFullFrameSym = true;
                     }
                 }
             }
 
-            const uint64_t targetFrame = (bestSymFullFrame > 0) ? bestSymFullFrame
+            const uint64_t targetFrame = (usedFullFrameSym && bestSymFullFrame > 0) ? bestSymFullFrame
                 : (bestCoarseFrame > 0 ? bestCoarseFrame : symEventFrame);
             std::cout << "\n[entry-debug] bestCoarseFrame=" << bestCoarseFrame
                       << " bestCoarseMs=" << std::fixed << std::setprecision(2) << bestCoarseTimeMs
@@ -1559,8 +1608,8 @@ int main(int argc, char* argv[]) {
                       << " bestSymScore=" << std::fixed << std::setprecision(3) << bestSymFullScore
                       << " targetFrame=" << targetFrame << "\n";
 
-            // Second pass: refine change-peak in a window around target symbol frame
-            if (targetFrame > 0) {
+            // Second pass: refine change-peak only if a full-frame symbol search was used (Python behavior)
+            if (usedFullFrameSym && targetFrame > 0) {
                 const int win = 30;
                 const int start = (targetFrame > (uint64_t)win) ? (int)(targetFrame - win) : 0;
                 const int end = (int)(std::min<uint64_t>(count - 1, targetFrame + win));
@@ -1762,6 +1811,31 @@ int main(int argc, char* argv[]) {
                                 if (fr3.frameIndex > bestChangeFrame + 1) break;
                             }
                         }
+                    }
+                }
+            }
+
+            // If we skipped refinement, still capture the best-change frame for scoring
+            if (bestChangeFrame > 0 && bestChangeFrameGray.empty()) {
+                trading_monitor::video::MFSourceReaderDecoder dec3;
+                std::string err3;
+                if (dec3.open(fs::path(resolved).wstring(), err3)) {
+                    trading_monitor::video::VideoFrameY fr3;
+                    while (dec3.readFrame(fr3, err3)) {
+                        if (fr3.frameIndex == bestChangeFrame || fr3.frameIndex == bestChangeFrame + 1) {
+                            std::vector<uint8_t> gray3(static_cast<size_t>(fr3.width) * static_cast<size_t>(fr3.height));
+                            for (int y = 0; y < fr3.height; ++y) {
+                                const uint8_t* srcRow = fr3.y.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.strideY);
+                                uint8_t* dstRow = gray3.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.width);
+                                std::memcpy(dstRow, srcRow, static_cast<size_t>(fr3.width));
+                            }
+                            if (fr3.frameIndex == bestChangeFrame) {
+                                bestChangeFrameGray = std::move(gray3);
+                            } else {
+                                bestChangeNextGray = std::move(gray3);
+                            }
+                        }
+                        if (fr3.frameIndex > bestChangeFrame + 1) break;
                     }
                 }
             }
