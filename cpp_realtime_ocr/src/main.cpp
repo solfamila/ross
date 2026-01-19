@@ -1199,10 +1199,10 @@ int main(int argc, char* argv[]) {
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
 
-                // Make search cheaper during bring-up
-                panelCfg.maxSearchW = 320.0f;
-                panelCfg.scales = {0.90f, 1.00f, 1.10f};
-                panelCfg.hdrThreshold = 0.30f;
+                // Match Python header search parameters
+                panelCfg.maxSearchW = static_cast<float>(frame.width) * 0.70f;
+                panelCfg.scales = {0.80f, 0.90f, 1.00f, 1.10f};
+                panelCfg.hdrThreshold = 0.55f;
                 panelCfg.detectOrder = false;
                 panelCfg.detectQuote = false;
                 trackCfg.minTrackScore = 0.40f;
@@ -1246,25 +1246,11 @@ int main(int argc, char* argv[]) {
                     }
                 };
 
-                if (!havePanel) {
+                {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     std::cerr << ">>> panel find start frame=" << frame.frameIndex << "\n" << std::flush;
 
-                    // Search only left half to cut work in half.
-                    const int leftW = (std::max)(1, frame.width / 2);
-                    std::vector<uint8_t> grayLeft(static_cast<size_t>(leftW) * static_cast<size_t>(frame.height));
-                    for (int y = 0; y < frame.height; ++y) {
-                        const uint8_t* srcRow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(frame.width);
-                        uint8_t* dstRow = grayLeft.data() + static_cast<size_t>(y) * static_cast<size_t>(leftW);
-                        std::memcpy(dstRow, srcRow, static_cast<size_t>(leftW));
-                    }
-
-                    found = panelFinder.findPanelsFromGray(grayLeft.data(), leftW, frame.height, panelCfg);
-
-                    if (!found.hasPositions) {
-                        // Fallback: try full frame once
-                        found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
-                    }
+                    found = panelFinder.findPanelsFromGray(gray.data(), frame.width, frame.height, panelCfg);
 
                     // One-time dump of matched header region to PNG for inspection.
                     static bool dumpedHeader = false;
@@ -1298,36 +1284,25 @@ int main(int argc, char* argv[]) {
                               << "\n" << std::flush;
 
                     profiler.markFind();
+                    havePanel = found.hasPositions;
                     if (!found.hasPositions) {
                         printProgress();
                         profiler.endFrame();
                         continue;
                     }
-                    tracker.init(hdrTpl, found.positionsHeader, found.positionsPanel);
-                    trackFailCount = 0;
-                    havePanel = true;
-                } else {
-                    auto tr = tracker.update(gray, frame.width, frame.height, trackCfg, frame.frameIndex, true);
-                    profiler.markTrack();
-                    trackScore = tr.score;
-                    if (!tr.ok) {
-                        trackFailCount++;
-                        if (trackFailCount >= 3) {
-                            havePanel = false;
-                            trackFailCount = 0;
-                        }
-                        printProgress();
-                        profiler.endFrame();
-                        continue;
-                    }
-                    trackFailCount = 0;
-                    found.positionsPanel = tr.panelRect;
-                    found.positionsHeader = tr.headerRect;
                 }
 
-                // Build trigger ROI periodically (no hardcoded columns)
+                // Build trigger ROI (match Python: fixed box under header)
                 if (!trigRoi.ok || (frame.frameIndex - lastTrigBuildFrame) >= (uint64_t)trigCfg.rebuildEveryNFrames) {
-                    trigRoi = trigBuilder.build(gray, frame.width, frame.height, found.positionsPanel, trigCfg);
+                    trading_monitor::ROI roiUnderHeader{};
+                    roiUnderHeader.name = "trigger_roi";
+                    roiUnderHeader.x = found.positionsHeader.x;
+                    roiUnderHeader.y = found.positionsHeader.y + found.positionsHeader.h + 5;
+                    roiUnderHeader.w = 260;
+                    roiUnderHeader.h = 220;
+                    roiUnderHeader = clampROIToFrame(roiUnderHeader, frame.width, frame.height);
+                    trigRoi.triggerRoi = roiUnderHeader;
+                    trigRoi.ok = (roiUnderHeader.w > 0 && roiUnderHeader.h > 0);
                     lastTrigBuildFrame = frame.frameIndex;
                     profiler.markRoiBuild();
                 }
@@ -1469,8 +1444,14 @@ int main(int argc, char* argv[]) {
         if (entryTriggerMode) {
             profiler.flush(profileJsonPath, profileSummaryPath);
 
-            const uint64_t targetFrame = (bestCoarseFrame > 0) ? bestCoarseFrame
-                : (symEventSet ? symEventFrame : bestSymFullFrame);
+            const uint64_t targetFrame = (bestSymFullFrame > 0) ? bestSymFullFrame
+                : (bestCoarseFrame > 0 ? bestCoarseFrame : symEventFrame);
+            std::cout << "\n[entry-debug] bestCoarseFrame=" << bestCoarseFrame
+                      << " bestCoarseMs=" << std::fixed << std::setprecision(2) << bestCoarseTimeMs
+                      << " symEventFrame=" << symEventFrame
+                      << " bestSymFullFrame=" << bestSymFullFrame
+                      << " bestSymScore=" << std::fixed << std::setprecision(3) << bestSymFullScore
+                      << " targetFrame=" << targetFrame << "\n";
 
             // Second pass: refine change-peak in a window around target symbol frame
             if (targetFrame > 0) {
