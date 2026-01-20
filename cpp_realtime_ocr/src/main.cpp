@@ -27,6 +27,7 @@
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -121,6 +122,127 @@ static bool writeJsonResults(const std::string& path, const std::vector<OCRResul
     out << "}\n";
     return out.good();
 }
+
+#if defined(TM_USE_OPENCV)
+struct OcrResult {
+    std::string text;
+    float score = -1.0f;
+};
+
+static float matchBestNcc(const cv::Mat& gray, const cv::Mat& tpl, cv::Point& bestLoc) {
+    if (gray.empty() || tpl.empty()) return -1.0f;
+    if (tpl.rows >= gray.rows || tpl.cols >= gray.cols) return -1.0f;
+    cv::Mat res;
+    cv::matchTemplate(gray, tpl, res, cv::TM_CCOEFF_NORMED);
+    double minv = 0.0, maxv = 0.0;
+    cv::Point minp, maxp;
+    cv::minMaxLoc(res, &minv, &maxv, &minp, &maxp);
+    bestLoc = maxp;
+    return (float)maxv;
+}
+
+static std::unordered_map<char, cv::Mat> buildGlyphTemplates(const cv::Size& size, double fontScale, int thickness) {
+    std::unordered_map<char, cv::Mat> glyphs;
+    for (char ch = 'A'; ch <= 'Z'; ++ch) {
+        cv::Mat img = cv::Mat::zeros(size, CV_8UC1);
+        cv::putText(img, std::string(1, ch), cv::Point(1, size.height - 6),
+                    cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255), thickness, cv::LINE_AA);
+        glyphs[ch] = img;
+    }
+    return glyphs;
+}
+
+static OcrResult ocrRowSymbol(const cv::Mat& grayRow) {
+    OcrResult out;
+    if (grayRow.empty()) return out;
+
+    cv::Mat row = grayRow;
+    if (row.cols > 220) row = row(cv::Rect(0, 0, 220, row.rows));
+
+    cv::Mat up;
+    cv::resize(row, up, cv::Size(row.cols * 2, row.rows * 2), 0.0, 0.0, cv::INTER_CUBIC);
+
+    cv::Mat bw;
+    cv::threshold(up, bw, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    std::vector<std::vector<cv::Point>> cnts;
+    cv::findContours(bw, cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    std::vector<cv::Rect> boxes;
+    for (const auto& c : cnts) {
+        cv::Rect r = cv::boundingRect(c);
+        int area = r.width * r.height;
+        if (area < 40) continue;
+        if (r.height < 12 || r.height > 80 || r.width < 5 || r.width > 60) continue;
+        boxes.push_back(r);
+    }
+    std::sort(boxes.begin(), boxes.end(), [](const cv::Rect& a, const cv::Rect& b){ return a.x < b.x; });
+    if (boxes.empty()) return out;
+    if (boxes.size() > 6) boxes.resize(6);
+
+    int rowH = (std::max)(18, (int)std::lround(up.rows * 0.9));
+    int glyphW = (std::max)(12, (int)std::lround(rowH * 0.6));
+    double fontScale = 0.6 * (rowH / 30.0);
+    int thickness = (rowH < 28) ? 1 : 2;
+    auto glyphs = buildGlyphTemplates(cv::Size(glyphW, rowH), fontScale, thickness);
+
+    std::string text;
+    std::vector<float> scores;
+    for (const auto& r : boxes) {
+        cv::Mat patch = bw(r);
+        if (patch.empty()) continue;
+        char bestCh = '?';
+        float bestSc = -1.0f;
+        for (const auto& kv : glyphs) {
+            const char ch = kv.first;
+            const cv::Mat& tpl = kv.second;
+            cv::Mat patchR;
+            cv::resize(patch, patchR, tpl.size(), 0.0, 0.0, cv::INTER_AREA);
+            cv::Mat res;
+            cv::matchTemplate(patchR, tpl, res, cv::TM_CCORR_NORMED);
+            double minv = 0.0, maxv = 0.0;
+            cv::minMaxLoc(res, &minv, &maxv, nullptr, nullptr);
+            float sc = (float)maxv;
+            if (sc > bestSc) {
+                bestSc = sc;
+                bestCh = ch;
+            }
+        }
+        text.push_back(bestCh);
+        scores.push_back(bestSc);
+    }
+
+    out.text = text;
+    if (!scores.empty()) {
+        float sum = 0.0f;
+        for (float s : scores) sum += s;
+        out.score = sum / (float)scores.size();
+    }
+    return out;
+}
+
+static float matchWordScore(const cv::Mat& grayRow, const std::string& word) {
+    if (grayRow.empty() || word.empty()) return -1.0f;
+    cv::Mat row = grayRow;
+    if (row.cols > 260) row = row(cv::Rect(0, 0, 260, row.rows));
+    cv::Mat up;
+    cv::resize(row, up, cv::Size(row.cols * 2, row.rows * 2), 0.0, 0.0, cv::INTER_CUBIC);
+
+    float best = -1.0f;
+    for (double s : {0.8, 1.0, 1.2}) {
+        int h = (std::max)(20, (int)std::lround(up.rows * 0.9));
+        int w = (std::max)(40, (int)std::lround(h * 0.7 * (int)word.size()));
+        cv::Mat tpl = cv::Mat::zeros(h, w, CV_8UC1);
+        double fontScale = 0.6 * (h / 30.0) * s;
+        int thickness = (h < 28) ? 1 : 2;
+        cv::putText(tpl, word, cv::Point(2, h - 6), cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255), thickness, cv::LINE_AA);
+        if (tpl.rows >= up.rows || tpl.cols >= up.cols) continue;
+        cv::Point loc;
+        float sc = matchBestNcc(up, tpl, loc);
+        best = (std::max)(best, sc);
+    }
+    return best;
+}
+#endif
 
 void signalHandler(int signal) {
     (void)signal;
@@ -1141,6 +1263,9 @@ int main(int argc, char* argv[]) {
         uint64_t bestChangeFrame = 0;
         double bestChangeTimeMs = 0.0;
         trading_monitor::ROI bestChangeRoi{};
+        int bestChangeRowY = 0;
+        int bestChangeRowH = 0;
+        bool bestChangeRowValid = false;
         std::vector<uint8_t> bestChangeFrameGray;
         std::vector<uint8_t> bestChangeNextGray;
         bool captureNext = false;
@@ -1164,6 +1289,7 @@ int main(int argc, char* argv[]) {
         int prevTrigCoarseW = 0;
         int prevTrigCoarseH = 0;
         bool usedFullFrameSym = false;
+        const bool useSymbolGate = false;
 
         trading_monitor::track::HeaderTemplate hdrTpl;
         if (entryTriggerMode) {
@@ -1426,7 +1552,12 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // Coarse change-peak on trigger ROI (always on)
+                // Match target symbol in trigger ROI (with location)
+                const auto symLocTrig = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                trigScore = symLocTrig.found ? symLocTrig.score : -1.0f;
+                profiler.markMatch(trigScore);
+
+                // Coarse change-peak on trigger ROI (row-constrained when symbol row is known)
                 {
                     const trading_monitor::ROI changeRoi = trigRoi.triggerRoi;
                     const int rx = (std::max)(0, (std::min)(changeRoi.x, frame.width - 1));
@@ -1440,11 +1571,54 @@ int main(int argc, char* argv[]) {
                         std::memcpy(dstRow, srcRow, (size_t)rw);
                     }
                     if (havePrevCoarse && prevTrigCoarseW == rw && prevTrigCoarseH == rh) {
-                        double sum = 0.0;
-                        for (size_t i = 0; i < trigCrop.size(); ++i) {
-                            sum += std::abs((int)trigCrop[i] - (int)prevTrigCoarse[i]);
+                        float ch = -1.0f;
+                        int rowY = 0;
+                        int rowH = 32;
+                        if (symLocTrig.found) {
+                            rowY = (std::max)(0, symLocTrig.y - changeRoi.y - 4);
+                            rowH = (std::min)(40, rh - rowY);
+                            if (rowH > 0) {
+                                double sum = 0.0;
+                                for (int y = 0; y < rowH; ++y) {
+                                    const uint8_t* nowRow = trigCrop.data() + (size_t)(rowY + y) * (size_t)rw;
+                                    const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)(rowY + y) * (size_t)rw;
+                                    for (int x = 0; x < rw; ++x) {
+                                        sum += std::abs((int)nowRow[x] - (int)prevRow[x]);
+                                    }
+                                }
+                                ch = (float)(sum / (double)(rw * rowH));
+                            }
+                        } else {
+                            std::vector<float> rowScores((size_t)rh, 0.0f);
+                            for (int y = 0; y < rh; ++y) {
+                                const uint8_t* nowRow = trigCrop.data() + (size_t)y * (size_t)rw;
+                                const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)y * (size_t)rw;
+                                double sumRow = 0.0;
+                                for (int x = 0; x < rw; ++x) {
+                                    sumRow += std::abs((int)nowRow[x] - (int)prevRow[x]);
+                                }
+                                rowScores[(size_t)y] = (float)(sumRow / (double)rw);
+                            }
+                            int bestRow = 0;
+                            float bestVal = rowScores.empty() ? 0.0f : rowScores[0];
+                            for (int y = 1; y < rh; ++y) {
+                                const float v = rowScores[(size_t)y];
+                                if (v > bestVal) { bestVal = v; bestRow = y; }
+                            }
+                            rowH = (std::min)(32, rh);
+                            rowY = (std::max)(0, bestRow - rowH / 2);
+                            rowH = (std::min)(rowH, rh - rowY);
+                            double sum = 0.0;
+                            for (int y = 0; y < rowH; ++y) {
+                                const uint8_t* nowRow = trigCrop.data() + (size_t)(rowY + y) * (size_t)rw;
+                                const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)(rowY + y) * (size_t)rw;
+                                for (int x = 0; x < rw; ++x) {
+                                    sum += std::abs((int)nowRow[x] - (int)prevRow[x]);
+                                }
+                            }
+                            ch = (float)(sum / (double)(rw * rowH));
                         }
-                        const float ch = (float)(sum / (double)trigCrop.size());
+
                         if (ch > bestCoarseChange) {
                             bestCoarseChange = ch;
                             bestCoarseFrame = frame.frameIndex;
@@ -1453,6 +1627,9 @@ int main(int argc, char* argv[]) {
                             bestChangeFrame = frame.frameIndex;
                             bestChangeTimeMs = frameTimeMs;
                             bestChangeRoi = changeRoi;
+                            bestChangeRowY = rowY;
+                            bestChangeRowH = rowH;
+                            bestChangeRowValid = (rowH > 0);
                         }
                     }
                     prevTrigCoarse = std::move(trigCrop);
@@ -1461,22 +1638,19 @@ int main(int argc, char* argv[]) {
                     havePrevCoarse = true;
                 }
 
-                // Match target symbol in trigger ROI (with location)
-                const auto symLocTrig = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, trigRoi.triggerRoi);
-                trigScore = symLocTrig.found ? symLocTrig.score : -1.0f;
-                profiler.markMatch(trigScore);
-
-                if (trigScore >= symPresentThresh) {
-                    symPresentCount++;
-                    if (symPresentCount == 1) {
-                        symPresentFirstFrame = frame.frameIndex;
+                if (useSymbolGate) {
+                    if (trigScore >= symPresentThresh) {
+                        symPresentCount++;
+                        if (symPresentCount == 1) {
+                            symPresentFirstFrame = frame.frameIndex;
+                        }
+                        if (symPresentCount >= symConfirmFrames && !symEventSet) {
+                            symEventSet = true;
+                            symEventFrame = symPresentFirstFrame;
+                        }
+                    } else {
+                        symPresentCount = 0;
                     }
-                    if (symPresentCount >= symConfirmFrames && !symEventSet) {
-                        symEventSet = true;
-                        symEventFrame = symPresentFirstFrame;
-                    }
-                } else {
-                    symPresentCount = 0;
                 }
 
                 // Track best symbol band using trigger ROI localization
@@ -1497,9 +1671,22 @@ int main(int argc, char* argv[]) {
                     bestSymTrigFrame = frame.frameIndex;
                 }
 
-                auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
-                profiler.markState(entry.state().armed, entry.state().triggered);
-                profiler.endFrame();
+                if (useSymbolGate) {
+                    auto ev = entry.update(frame.frameIndex, frameTimeMs, -1.f, -1.f, trigScore);
+                    profiler.markState(entry.state().armed, entry.state().triggered);
+                    profiler.endFrame();
+                    if (ev.fired) {
+                        profiler.flush(profileJsonPath, profileSummaryPath);
+                        std::cout << "\n[entry-trigger] " << targetSymbol
+                                  << " window_ms=(" << std::fixed << std::setprecision(2)
+                                  << ev.absentLastTimeMs << "," << ev.presentFirstTimeMs << "]"
+                                  << " est_ms=(" << ev.absentLastTimeEstMs << "," << ev.presentFirstTimeEstMs << "]\n";
+                        return 0;
+                    }
+                } else {
+                    profiler.markState(entry.state().armed, entry.state().triggered);
+                    profiler.endFrame();
+                }
 
                 if (frame.frameIndex < 60) {
                     std::cout
@@ -1511,14 +1698,6 @@ int main(int argc, char* argv[]) {
                         << "\n";
                 }
 
-                if (ev.fired) {
-                    profiler.flush(profileJsonPath, profileSummaryPath);
-                    std::cout << "\n[entry-trigger] " << targetSymbol
-                              << " window_ms=(" << std::fixed << std::setprecision(2)
-                              << ev.absentLastTimeMs << "," << ev.presentFirstTimeMs << "]"
-                              << " est_ms=(" << ev.absentLastTimeEstMs << "," << ev.presentFirstTimeEstMs << "]\n";
-                    return 0;
-                }
                 continue;
             }
 
@@ -1846,6 +2025,68 @@ int main(int argc, char* argv[]) {
                 if (!useGray.empty()) {
                     scoreAtChange = sym.matchInGrayROI(useGray, frame.width, frame.height, bestChangeRoi);
                 }
+#if defined(TM_USE_OPENCV)
+                bool ocrOk = true;
+                std::string ocrText;
+                float ocrScore = -1.0f;
+                float wordScore = -1.0f;
+                float tplScore = -1.0f;
+
+                if (!useGray.empty()) {
+                    cv::Mat frameMat(dec.height(), dec.width(), CV_8UC1, (void*)useGray.data());
+                    cv::Rect roiRect(bestChangeRoi.x, bestChangeRoi.y, bestChangeRoi.w, bestChangeRoi.h);
+                    roiRect = roiRect & cv::Rect(0, 0, frameMat.cols, frameMat.rows);
+                    if (roiRect.width > 0 && roiRect.height > 0) {
+                        cv::Mat roi = frameMat(roiRect).clone();
+
+                        int baseY = bestChangeRowValid ? bestChangeRowY : 0;
+                        OcrResult bestOcr;
+                        cv::Mat bestRowPatch;
+                        for (int rowH : {28, 32, 36}) {
+                            for (int off : {-8, -4, 0, 4, 8}) {
+                                int y0 = (std::max)(0, baseY + off - rowH / 2);
+                                int y1 = (std::min)(roi.rows, y0 + rowH);
+                                if (y1 <= y0) continue;
+                                cv::Mat rowPatch = roi(cv::Rect(0, y0, roi.cols, y1 - y0));
+                                auto res = ocrRowSymbol(rowPatch);
+                                if (res.score > bestOcr.score) {
+                                    bestOcr = res;
+                                    bestRowPatch = rowPatch.clone();
+                                }
+                            }
+                        }
+                        ocrText = bestOcr.text;
+                        ocrScore = bestOcr.score;
+                        if (ocrText.empty() || ocrText.rfind(targetSymbol, 0) != 0) {
+                            ocrOk = false;
+                        }
+
+                        if (!ocrOk) {
+                            int y0 = (std::max)(0, baseY - 14);
+                            int y1 = (std::min)(roi.rows, y0 + 28);
+                            if (y1 > y0) {
+                                cv::Mat wordPatch = roi(cv::Rect(0, y0, roi.cols, y1 - y0));
+                                wordScore = matchWordScore(wordPatch, targetSymbol);
+                                trading_monitor::ROI wordRoi{"word", bestChangeRoi.x, bestChangeRoi.y + y0, bestChangeRoi.w, y1 - y0};
+                                tplScore = sym.matchInGrayROI(useGray, frame.width, frame.height, wordRoi);
+                                if (wordScore >= 0.50f || tplScore >= 0.55f) {
+                                    ocrOk = true;
+                                    ocrText = targetSymbol;
+                                    ocrScore = (std::max)(wordScore, tplScore);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!ocrOk) {
+                    std::cout << "\n[entry-ocr] mismatch target=" << targetSymbol
+                              << " ocr='" << ocrText << "' ocrScore=" << std::fixed << std::setprecision(3) << ocrScore
+                              << " wordScore=" << std::fixed << std::setprecision(3) << wordScore
+                              << " tplScore=" << std::fixed << std::setprecision(3) << tplScore << "\n";
+                    return 1;
+                }
+#endif
                 const double absentMs = (dec.fps() > 0.0) ? (1000.0 * (double)(bestChangeFrame - 1) / dec.fps())
                                                         : (bestChangeTimeMs - (1000.0 / 30.0));
                 std::cout << "\n[entry-change] " << targetSymbol
