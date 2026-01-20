@@ -35,6 +35,17 @@ static std::vector<uint8_t> cropGrayRegion(const std::vector<uint8_t>& src, int 
 }
 
 static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH) {
+#if defined(TM_USE_OPENCV)
+    cv::Mat srcMat(srcH, srcW, CV_8UC1, (void*)src.data());
+    cv::Mat dstMat;
+    cv::resize(srcMat, dstMat, cv::Size(dstW, dstH), 0.0, 0.0, cv::INTER_AREA);
+    std::vector<uint8_t> dst((size_t)dstW * (size_t)dstH);
+    for (int y = 0; y < dstH; ++y) {
+        const uint8_t* row = dstMat.ptr<uint8_t>(y);
+        std::memcpy(dst.data() + (size_t)y * (size_t)dstW, row, (size_t)dstW);
+    }
+    return dst;
+#else
     std::vector<uint8_t> dst((size_t)dstW * (size_t)dstH);
     for (int y = 0; y < dstH; ++y) {
         int sy = (y * srcH) / dstH;
@@ -46,6 +57,7 @@ static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, i
         }
     }
     return dst;
+#endif
 }
 
 struct MatchResult { bool found=false; float score=0; int x=0,y=0; };

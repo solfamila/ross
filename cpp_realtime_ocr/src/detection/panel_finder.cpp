@@ -45,6 +45,17 @@ static void bgraToGray(const uint8_t* bgra, int w, int h, int strideBytes, std::
 
 
 static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, int srcW, int srcH, int dstW, int dstH) {
+#if defined(TM_USE_OPENCV)
+    cv::Mat srcMat(srcH, srcW, CV_8UC1, (void*)src.data());
+    cv::Mat dstMat;
+    cv::resize(srcMat, dstMat, cv::Size(dstW, dstH), 0.0, 0.0, cv::INTER_AREA);
+    std::vector<uint8_t> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
+    for (int y = 0; y < dstH; ++y) {
+        const uint8_t* row = dstMat.ptr<uint8_t>(y);
+        std::memcpy(dst.data() + static_cast<size_t>(y) * static_cast<size_t>(dstW), row, static_cast<size_t>(dstW));
+    }
+    return dst;
+#else
     std::vector<uint8_t> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH));
     for (int y = 0; y < dstH; ++y) {
         const int sy = (srcH == 1) ? 0 : (y * (srcH - 1)) / (dstH - 1);
@@ -55,6 +66,7 @@ static std::vector<uint8_t> resizeGrayNearest(const std::vector<uint8_t>& src, i
         }
     }
     return dst;
+#endif
 }
 
 static bool loadTemplateGray(const std::string& path, std::vector<uint8_t>& tplGray, int& tplW, int& tplH) {

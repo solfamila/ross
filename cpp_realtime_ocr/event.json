@@ -1,0 +1,19 @@
+{
+  "video": "C:/Users/forfr/Downloads/trade/trade1_first_10s.mp4",
+  "fps": 30.0,
+  "event": {
+    "target": "APVO",
+    "method": "symbol_gate",
+    "absent_last_frame": 16,
+    "present_first_frame": 17,
+    "absent_last_time_ms": 533.3333333333334,
+    "present_first_time_ms": 566.6666666666666,
+    "window_ms": [
+      533.3333333333334,
+      566.6666666666666
+    ],
+    "best_change": 1.565576923076923,
+    "best_symbol_score": 1.0,
+    "best_symbol_frame": 18
+  }
+}

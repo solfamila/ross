@@ -6,6 +6,11 @@
 
 #include "utils/stb_image.h"
 
+#if defined(TM_USE_OPENCV)
+#include <opencv2/imgproc.hpp>
+#include <opencv2/core.hpp>
+#endif
+
 namespace {
 static void bgraToGrayStride(const uint8_t* bgra, int w, int h, int strideBytes,
                              std::vector<uint8_t>& outGray) {
@@ -53,6 +58,19 @@ static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int
                                     const std::vector<uint8_t>& tpl, int tW, int tH) {
     MatchResult best;
     if (tW <= 0 || tH <= 0 || iW < tW || iH < tH) return best;
+#if defined(TM_USE_OPENCV)
+    cv::Mat imgMat(iH, iW, CV_8UC1, (void*)img.data());
+    cv::Mat tplMat(tH, tW, CV_8UC1, (void*)tpl.data());
+    cv::Mat res;
+    cv::matchTemplate(imgMat, tplMat, res, cv::TM_CCOEFF_NORMED);
+    double minv, maxv; cv::Point minp, maxp;
+    cv::minMaxLoc(res, &minv, &maxv, &minp, &maxp);
+    best.found = true;
+    best.score = static_cast<float>(maxv);
+    best.x = maxp.x;
+    best.y = maxp.y;
+    return best;
+#else
     const int n = tW * tH;
     double sumT=0,sumT2=0;
     for (int i=0;i<n;++i){ double v=tpl[(size_t)i]; sumT+=v; sumT2+=v*v; }
@@ -89,6 +107,7 @@ static MatchResult matchTemplateNCC(const std::vector<uint8_t>& img, int iW, int
         }
     }
     return best;
+#endif
 }
 }
 
@@ -115,7 +134,19 @@ bool SymbolMatcher::loadSymbolTemplates(const std::string& dir, const std::strin
         SymbolTemplate t;
         t.w = w; t.h = h;
         bgraToGrayStride(bgra.data(), w, h, w*4, t.gray);
-        if (!t.gray.empty()) m_templates.push_back(std::move(t));
+        if (!t.gray.empty()) {
+            double sum = 0.0;
+            double sum2 = 0.0;
+            for (uint8_t v : t.gray) {
+                sum += v;
+                sum2 += (double)v * (double)v;
+            }
+            const double mean = sum / (double)t.gray.size();
+            const double var = sum2 - (double)t.gray.size() * mean * mean;
+            if (var > 1e-6) {
+                m_templates.push_back(std::move(t));
+            }
+        }
     }
 
     if (m_templates.empty()) {
