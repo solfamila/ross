@@ -183,6 +183,38 @@ __global__ void bgraTexToGrayU8ROIKernel(
 }
 
 /**
+ * @brief Luma ROI diff row sums + update prev ROI
+ */
+__global__ void lumaDiffRowSumsUpdateKernel(
+    const uint8_t* __restrict__ input,
+    size_t inputPitch,
+    int roiX, int roiY,
+    int roiWidth, int roiHeight,
+    int bandX0, int bandX1,
+    uint8_t* __restrict__ prev,
+    unsigned int* __restrict__ rowSums
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= roiWidth || y >= roiHeight) return;
+
+    const int srcX = roiX + x;
+    const int srcY = roiY + y;
+    const uint8_t* row = input + static_cast<size_t>(srcY) * inputPitch;
+    const uint8_t cur = row[srcX];
+
+    const size_t prevIdx = static_cast<size_t>(y) * static_cast<size_t>(roiWidth) + static_cast<size_t>(x);
+    const uint8_t old = prev[prevIdx];
+    prev[prevIdx] = cur;
+
+    if (x >= bandX0 && x < bandX1) {
+        const unsigned int diff = static_cast<unsigned int>(cur > old ? cur - old : old - cur);
+        atomicAdd(&rowSums[y], diff);
+    }
+}
+
+/**
  * @brief Contrast enhancement kernel
  */
 __global__ void contrastEnhanceKernel(
@@ -649,6 +681,41 @@ cudaError_t launchYOLOPreprocessFromBGRA(
 
     yoloPreprocessFromBGRAKernel<<<gridSize, blockSize, 0, stream>>>(
         input, frameWidth, frameHeight, output, outWidth, outHeight
+    );
+
+    return cudaGetLastError();
+}
+
+cudaError_t launchLumaDiffRowSumsUpdate(
+    const uint8_t* input,
+    size_t inputPitch,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight,
+    int bandX0,
+    int bandX1,
+    uint8_t* prev,
+    unsigned int* rowSums,
+    cudaStream_t stream
+) {
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    dim3 grid(
+        (roiWidth + block.x - 1) / block.x,
+        (roiHeight + block.y - 1) / block.y
+    );
+
+    lumaDiffRowSumsUpdateKernel<<<grid, block, 0, stream>>>(
+        input,
+        inputPitch,
+        roiX,
+        roiY,
+        roiWidth,
+        roiHeight,
+        bandX0,
+        bandX1,
+        prev,
+        rowSums
     );
 
     return cudaGetLastError();

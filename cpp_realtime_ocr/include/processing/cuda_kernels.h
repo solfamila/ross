@@ -278,6 +278,37 @@ cudaError_t launchYOLOPreprocessFromBGRA(
     cudaStream_t stream = 0
 );
 
+/**
+ * @brief Compute per-row abs-diff sums between current luma ROI and previous ROI,
+ *        updating previous ROI in-place on device.
+ *
+ * @param input       Input luma plane (device)
+ * @param inputPitch  Pitch in bytes for input luma
+ * @param roiX        ROI top-left X coordinate
+ * @param roiY        ROI top-left Y coordinate
+ * @param roiWidth    ROI width
+ * @param roiHeight   ROI height
+ * @param bandX0      Band start X (relative to ROI)
+ * @param bandX1      Band end X (relative to ROI, exclusive)
+ * @param prev        Previous ROI buffer (device, size roiWidth*roiHeight)
+ * @param rowSums     Output per-row sums (device, size roiHeight)
+ * @param stream      CUDA stream
+ * @return cudaError_t
+ */
+cudaError_t launchLumaDiffRowSumsUpdate(
+    const uint8_t* input,
+    size_t inputPitch,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight,
+    int bandX0,
+    int bandX1,
+    uint8_t* prev,
+    unsigned int* rowSums,
+    cudaStream_t stream = 0
+);
+
 } // namespace cuda
 } // namespace trading_monitor
 

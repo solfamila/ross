@@ -62,6 +62,10 @@ if(MSVC AND CMAKE_CXX_COMPILER)
 endif()
 
 find_package(CUDAToolkit 13.0 REQUIRED)
+find_package(FFMPEG REQUIRED)
+
+set(NVCODEC_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvcodec)
+find_library(NVCUVID_LIB NAMES nvcuvid HINTS ${NVCODEC_ROOT}/Samples/NvCodec/Lib/x64 REQUIRED)
 
 # Optional OpenCV (used for fast template matching / tracking in entry-trigger mode)
 find_package(OpenCV QUIET COMPONENTS core imgproc)
@@ -136,7 +140,10 @@ set(CPP_SOURCES
     src/main.cpp
     src/capture/d3d11_capture.cpp
     src/capture/cuda_interop.cpp
+    src/video/mf_demuxer.cpp
+    src/video/nvdec_decoder.cpp
     src/video/mf_source_reader.cpp
+    third_party/nvcodec/Samples/NvCodec/NvDecoder/NvDecoder.cpp
     src/tracking/panel_tracker.cpp
     src/tracking/edge_expand.cpp
     src/processing/roi_extractor.cpp
@@ -170,6 +177,8 @@ set(CUDA_SOURCES
 set(HEADER_FILES
     include/capture/d3d11_capture.h
     include/capture/cuda_interop.h
+    include/video/mf_demuxer.h
+    include/video/nvdec_decoder.h
     include/video/mf_source_reader.h
     include/tracking/panel_tracker.h
     include/tracking/edge_expand.h
@@ -206,6 +215,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TENSORRT_ROOT}/include
     ${CUDAToolkit_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
+    ${NVCODEC_ROOT}/Samples/NvCodec
+    ${NVCODEC_ROOT}/Samples/NvCodec/NvDecoder
+    ${NVCODEC_ROOT}/Samples/Utils
 )
 
 # =============================================================================
@@ -215,6 +228,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # CUDA libraries
     CUDA::cudart
     CUDA::cuda_driver
+    ${NVCUVID_LIB}
     
     # TensorRT libraries
     ${TENSORRT_NVINFER}
@@ -232,6 +246,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     
     # JSON library
     nlohmann_json::nlohmann_json
+
+    # FFmpeg (bitstream filter)
+    ${FFMPEG_LIBRARIES}
 )
 
 if (OpenCV_FOUND)

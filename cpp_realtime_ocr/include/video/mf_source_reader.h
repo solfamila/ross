@@ -18,6 +18,11 @@ struct VideoFrameY {
     int64_t pts100ns = 0; // presentation timestamp in 100ns units
     uint64_t frameIndex = 0;
 
+    // Optional GPU backing (NVDEC path)
+    const uint8_t* devPtr = nullptr;
+    int devPitch = 0; // bytes per row (Y plane on GPU)
+    bool onGpu = false;
+
     // Luma plane (size = strideY * height)
     std::vector<uint8_t> y;
 };

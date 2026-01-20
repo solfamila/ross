@@ -276,6 +276,9 @@ bool MFSourceReaderDecoder::readFrame(VideoFrameY& out, std::string& err) {
         out.strideY = absStride;
         out.pts100ns = static_cast<int64_t>(ts100ns);
         out.frameIndex = m_frameIndex++;
+        out.devPtr = nullptr;
+        out.devPitch = 0;
+        out.onGpu = false;
 
         out.y.resize(static_cast<size_t>(out.strideY) * static_cast<size_t>(out.height));
 

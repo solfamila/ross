@@ -18,6 +18,11 @@
 | **Windows** | 11 22H2+ | Required for Windows.Graphics.Capture |
 | **GPU** | RTX 30/40/50 series | Compute 8.0+ recommended |
 
+### Third-Party Notices
+
+- NVIDIA Video Codec SDK samples are included under [third_party/nvcodec](third_party/nvcodec). See NVIDIA's EULA in [third_party/nvcodec/Samples/LicenseAgreement.pdf](third_party/nvcodec/Samples/LicenseAgreement.pdf).
+- FFmpeg is used for MP4 bitstream filtering (AVCC -> Annex B). Ensure your FFmpeg build complies with its license terms.
+
 ---
 
 ## Table of Contents
@@ -62,6 +67,9 @@ cmake --build . -j 4
 
 # Offline MP4 decode smoke-test (Media Foundation)
 .\trading_monitor.exe --video sample.mp4 --video-max-frames 300
+
+# Offline MP4 decode (NVDEC + MF demux)
+.\trading_monitor.exe --video sample.mp4 --video-nvdec --video-max-frames 300
 
 # Offline panel auto-detection (Phase 2 scaffolding)
 # Expects these files under templates/headers/:

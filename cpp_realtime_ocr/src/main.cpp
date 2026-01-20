@@ -20,6 +20,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -63,6 +64,9 @@
 #include "utils/timer.h"
 #include "utils/profiler.h"
 #include "video/mf_source_reader.h"
+#include "video/mf_demuxer.h"
+#include "video/nvdec_decoder.h"
+#include "processing/cuda_kernels.h"
 
 #include "tracking/panel_tracker.h"
 
@@ -208,6 +212,7 @@ static OcrResult ocrRowSymbol(const cv::Mat& grayRow) {
                 bestCh = ch;
             }
         }
+
         text.push_back(bestCh);
         scores.push_back(bestSc);
     }
@@ -265,6 +270,7 @@ void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n\n"
               << "Options:\n"
               << "  --video <path>     Offline mode: decode frames from MP4 (Media Foundation) and exit\n"
+              << "  --video-nvdec      Offline mode: use NVDEC decode with MF demux + FFmpeg bitstream filter\n"
               << "  --video-max-frames <n>  Offline mode: decode at most N frames (0 = until EOF)\n"
               << "  --start-frame <n>  Offline mode: skip frames before N\n"
               << "  --end-frame <n>    Offline mode: stop after N (inclusive)\n"
@@ -932,6 +938,7 @@ int main(int argc, char* argv[]) {
     int videoMaxFrames = 0; // 0 = decode until EOF
     int videoStartFrame = 0;
     int videoEndFrame = -1;
+    bool videoNvdec = false;
 
     // Entry-trigger mode (timing-first)
     std::string modeStr = "panel-detect"; // panel-detect | entry-trigger
@@ -1015,6 +1022,8 @@ int main(int argc, char* argv[]) {
             videoEndFrame = std::stoi(argv[++i]);
         } else if (arg == "--video" && i + 1 < argc) {
             videoPath = argv[++i];
+        } else if (arg == "--video-nvdec") {
+            videoNvdec = true;
         } else if (arg == "--mode" && i + 1 < argc) {
             modeStr = argv[++i];
         } else if (arg == "--target" && i + 1 < argc) {
@@ -1237,17 +1246,55 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        const bool useNvdec = videoNvdec;
         trading_monitor::video::MFSourceReaderDecoder dec;
-        if (!dec.open(fs::path(resolved).wstring(), err)) {
-            std::cerr << "ERROR: Video open failed: " << err << "\n";
-            return 1;
+        trading_monitor::video::MFDemuxer demux;
+        trading_monitor::video::NvdecDecoder nvdec;
+        std::deque<trading_monitor::video::VideoFrameY> nvFrames;
+        uint64_t nvFrameIndex = 0;
+        int videoWidth = 0;
+        int videoHeight = 0;
+        double videoFps = 0.0;
+
+        if (useNvdec) {
+            if (!demux.open(fs::path(resolved).wstring(), err)) {
+                std::cerr << "ERROR: Video demux failed: " << err << "\n";
+                return 1;
+            }
+
+            cudaVideoCodec codec = cudaVideoCodec_H264;
+            if (demux.codec() == trading_monitor::video::DemuxCodec::HEVC) {
+                codec = cudaVideoCodec_HEVC;
+            } else if (demux.codec() != trading_monitor::video::DemuxCodec::H264) {
+                std::cerr << "ERROR: Unsupported codec for NVDEC (only H264/HEVC).\n";
+                return 1;
+            }
+
+            if (!nvdec.open(demux.width(), demux.height(), codec, err)) {
+                std::cerr << "ERROR: NVDEC open failed: " << err << "\n";
+                return 1;
+            }
+
+            videoWidth = demux.width();
+            videoHeight = demux.height();
+            videoFps = demux.fps();
+
+            std::cout << "Offline video decode (NVDEC + MF demux)\n";
+        } else {
+            if (!dec.open(fs::path(resolved).wstring(), err)) {
+                std::cerr << "ERROR: Video open failed: " << err << "\n";
+                return 1;
+            }
+            videoWidth = dec.width();
+            videoHeight = dec.height();
+            videoFps = dec.fps();
+            std::cout << "Offline video decode (Media Foundation)\n";
         }
 
-        std::cout << "Offline video decode (Media Foundation)\n";
         std::cout << "  Source: " << resolved << "\n";
-        std::cout << "  Size:   " << dec.width() << "x" << dec.height() << "\n";
-        if (dec.fps() > 0.0) {
-            std::cout << "  FPS~:   " << std::fixed << std::setprecision(3) << dec.fps() << "\n";
+        std::cout << "  Size:   " << videoWidth << "x" << videoHeight << "\n";
+        if (videoFps > 0.0) {
+            std::cout << "  FPS~:   " << std::fixed << std::setprecision(3) << videoFps << "\n";
         }
 
         trading_monitor::video::VideoFrameY frame;
@@ -1271,6 +1318,8 @@ int main(int argc, char* argv[]) {
         double bestChange = -1.0;
         uint64_t bestChangeFrame = 0;
         int bestRowY = 0;
+        int bestRoiX = 0;
+        int bestRoiY = 0;
         int bestRoiW = 0;
         int bestRoiH = 0;
         std::vector<uint8_t> prevRoi;
@@ -1282,6 +1331,12 @@ int main(int argc, char* argv[]) {
         int bestRoiNext2W = 0;
         int bestRoiNext2H = 0;
         bool captureNextRoi = false;
+        uint8_t* d_prevRoi = nullptr;
+        size_t d_prevRoiBytes = 0;
+        unsigned int* d_rowSums = nullptr;
+        size_t d_rowSumsBytes = 0;
+        std::vector<unsigned int> h_rowSums;
+        bool prevRoiGpuValid = false;
         float bestSymFullScore = -1.0f;
         uint64_t bestSymFullFrame = 0;
         float bestSymTrigScore = -1.0f;
@@ -1322,9 +1377,64 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        auto readFrame = [&](trading_monitor::video::VideoFrameY& out, std::string& readErr) -> bool {
+            readErr.clear();
+            if (!useNvdec) {
+                return dec.readFrame(out, readErr);
+            }
+
+            while (nvFrames.empty()) {
+                trading_monitor::video::DemuxPacket pkt;
+                if (!demux.readPacket(pkt, readErr)) {
+                    return false;
+                }
+                if (pkt.endOfStream) {
+                    return false;
+                }
+
+                std::vector<trading_monitor::video::DecodedFrame> decoded;
+                if (!nvdec.decode(pkt.data.data(), static_cast<int>(pkt.data.size()), pkt.pts100ns, decoded, readErr)) {
+                    return false;
+                }
+                for (const auto& f : decoded) {
+                    trading_monitor::video::VideoFrameY hostFrame;
+                    hostFrame.width = f.width;
+                    hostFrame.height = f.height;
+                    hostFrame.strideY = f.width;
+                    hostFrame.pts100ns = f.pts100ns;
+                    hostFrame.frameIndex = nvFrameIndex++;
+                    hostFrame.devPtr = reinterpret_cast<const uint8_t*>(f.devPtr);
+                    hostFrame.devPitch = f.pitch;
+                    hostFrame.onGpu = true;
+                    hostFrame.y.resize(static_cast<size_t>(f.width) * static_cast<size_t>(f.height));
+
+                    cudaError_t cudaErr = cudaMemcpy2D(
+                        hostFrame.y.data(),
+                        static_cast<size_t>(hostFrame.strideY),
+                        reinterpret_cast<const void*>(f.devPtr),
+                        static_cast<size_t>(f.pitch),
+                        static_cast<size_t>(hostFrame.width),
+                        static_cast<size_t>(hostFrame.height),
+                        cudaMemcpyDeviceToHost);
+
+                    if (cudaErr != cudaSuccess) {
+                        readErr = std::string("cudaMemcpy2D NVDEC->host failed: ") + cudaGetErrorString(cudaErr);
+                        return false;
+                    }
+
+                    nvFrames.push_back(std::move(hostFrame));
+                }
+            }
+
+            trading_monitor::video::VideoFrameY f = std::move(nvFrames.front());
+            nvFrames.pop_front();
+            out = std::move(f);
+            return true;
+        };
+
         while (g_running) {
             if (videoMaxFrames > 0 && count >= static_cast<uint64_t>(videoMaxFrames)) break;
-            if (!dec.readFrame(frame, err)) {
+            if (!readFrame(frame, err)) {
                 if (err == "STREAMTICK" || err == "NOSAMPLE") {
                     if (++emptyCount > kMaxEmpty) {
                         std::cerr << "MF decoder produced no frames after many attempts.\n";
@@ -1338,8 +1448,8 @@ int main(int argc, char* argv[]) {
             emptyCount = 0;
 
             double frameTimeMs = static_cast<double>(frame.pts100ns) / 10000.0;
-            if (dec.fps() > 0.0) {
-                frameTimeMs = 1000.0 * (static_cast<double>(frame.frameIndex) / dec.fps());
+            if (videoFps > 0.0) {
+                frameTimeMs = 1000.0 * (static_cast<double>(frame.frameIndex) / videoFps);
             }
 
             if (entryTriggerMode) {
@@ -1579,77 +1689,239 @@ int main(int argc, char* argv[]) {
                     const trading_monitor::ROI& tR = trigRoi.triggerRoi;
                     if (tR.w > 0 && tR.h > 0 && tR.x >= 0 && tR.y >= 0 &&
                         (tR.x + tR.w) <= frame.width && (tR.y + tR.h) <= frame.height) {
+                        const int bandX0 = 0;
+                        const int bandX1 = (std::min)(90, tR.w);
+                        const int bandW = (std::max)(1, bandX1 - bandX0);
 
-                        std::vector<uint8_t> roiNow(static_cast<size_t>(tR.w) * static_cast<size_t>(tR.h));
-                        for (int yy = 0; yy < tR.h; ++yy) {
-                            const uint8_t* src = gray.data() + static_cast<size_t>(tR.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
-                            uint8_t* dst = roiNow.data() + static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
-                            std::memcpy(dst, src, static_cast<size_t>(tR.w));
+                        if (symLocTrig.found && targetRowY < 0) {
+                            int relY = symLocTrig.y - tR.y + (symLocTrig.h / 2);
+                            targetRowY = (std::max)(0, relY - targetRowH / 2);
+                            if (targetRowY + targetRowH > tR.h) {
+                                targetRowY = (std::max)(0, tR.h - targetRowH);
+                            }
+                            if (!targetRowLogged) {
+                                std::cout << "[entry-debug] symLocTrig score=" << std::fixed << std::setprecision(3) << symLocTrig.score
+                                          << " loc=" << symLocTrig.x << "," << symLocTrig.y
+                                          << " targetRowY=" << targetRowY << "\n";
+                                targetRowLogged = true;
+                            }
                         }
 
-                        if (captureNextRoi && frame.frameIndex == bestChangeFrame + 1) {
-                            bestRoiNext = roiNow;
-                            bestRoiNextW = tR.w;
-                            bestRoiNextH = tR.h;
-                        } else if (captureNextRoi && frame.frameIndex == bestChangeFrame + 2) {
-                            bestRoiNext2 = roiNow;
-                            bestRoiNext2W = tR.w;
-                            bestRoiNext2H = tR.h;
-                            captureNextRoi = false;
-                        }
+                        bool useGpuDiff = (useNvdec && frame.onGpu && frame.devPtr != nullptr);
 
-                        if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
-                            if (symLocTrig.found && targetRowY < 0) {
-                                int relY = symLocTrig.y - tR.y + (symLocTrig.h / 2);
-                                targetRowY = (std::max)(0, relY - targetRowH / 2);
-                                if (targetRowY + targetRowH > tR.h) {
-                                    targetRowY = (std::max)(0, tR.h - targetRowH);
+                        if (useGpuDiff) {
+                            const size_t roiBytes = static_cast<size_t>(tR.w) * static_cast<size_t>(tR.h);
+                            if (!d_prevRoi || d_prevRoiBytes != roiBytes) {
+                                if (d_prevRoi) cudaFree(d_prevRoi);
+                                if (d_rowSums) cudaFree(d_rowSums);
+                                d_prevRoi = nullptr;
+                                d_rowSums = nullptr;
+                                d_prevRoiBytes = roiBytes;
+                                d_rowSumsBytes = static_cast<size_t>(tR.h) * sizeof(unsigned int);
+                                h_rowSums.assign(static_cast<size_t>(tR.h), 0u);
+                                if (cudaMalloc(&d_prevRoi, d_prevRoiBytes) != cudaSuccess ||
+                                    cudaMalloc(&d_rowSums, d_rowSumsBytes) != cudaSuccess) {
+                                    std::cerr << "[entry-warn] cudaMalloc failed for GPU diff buffers. Falling back to CPU.\n";
+                                    useGpuDiff = false;
+                                    if (d_prevRoi) { cudaFree(d_prevRoi); d_prevRoi = nullptr; }
+                                    if (d_rowSums) { cudaFree(d_rowSums); d_rowSums = nullptr; }
+                                    d_prevRoiBytes = 0;
+                                    d_rowSumsBytes = 0;
                                 }
-                                if (!targetRowLogged) {
-                                    std::cout << "[entry-debug] symLocTrig score=" << std::fixed << std::setprecision(3) << symLocTrig.score
-                                              << " loc=" << symLocTrig.x << "," << symLocTrig.y
-                                              << " targetRowY=" << targetRowY << "\n";
-                                    targetRowLogged = true;
+                                prevRoiGpuValid = false;
+                            }
+
+                            if (useGpuDiff) {
+                                const uint8_t* d_frame = frame.devPtr;
+                                if (!prevRoiGpuValid) {
+                                    cudaError_t copyErr = cudaMemcpy2D(
+                                        d_prevRoi,
+                                        static_cast<size_t>(tR.w),
+                                        d_frame + static_cast<size_t>(tR.y) * static_cast<size_t>(frame.devPitch) + static_cast<size_t>(tR.x),
+                                        static_cast<size_t>(frame.devPitch),
+                                        static_cast<size_t>(tR.w),
+                                        static_cast<size_t>(tR.h),
+                                        cudaMemcpyDeviceToDevice);
+                                    if (copyErr != cudaSuccess) {
+                                        std::cerr << "[entry-warn] cudaMemcpy2D init failed: " << cudaGetErrorString(copyErr) << "\n";
+                                        useGpuDiff = false;
+                                    } else {
+                                        prevRoiGpuValid = true;
+                                    }
                                 }
                             }
 
-                            double sum = 0.0;
-                            double bestRow = -1.0;
-                            int bestRowIdx = 0;
+                            if (useGpuDiff && prevRoiGpuValid) {
+                                cudaError_t clearErr = cudaMemset(d_rowSums, 0, d_rowSumsBytes);
+                                if (clearErr != cudaSuccess) {
+                                    std::cerr << "[entry-warn] cudaMemset row sums failed: " << cudaGetErrorString(clearErr) << "\n";
+                                    useGpuDiff = false;
+                                }
+
+                                if (useGpuDiff) {
+                                    cudaError_t kernErr = trading_monitor::cuda::launchLumaDiffRowSumsUpdate(
+                                        frame.devPtr,
+                                        static_cast<size_t>(frame.devPitch),
+                                        tR.x,
+                                        tR.y,
+                                        tR.w,
+                                        tR.h,
+                                        bandX0,
+                                        bandX1,
+                                        d_prevRoi,
+                                        d_rowSums,
+                                        0);
+                                    if (kernErr != cudaSuccess) {
+                                        std::cerr << "[entry-warn] GPU diff kernel failed: " << cudaGetErrorString(kernErr) << "\n";
+                                        useGpuDiff = false;
+                                    }
+                                }
+
+                                if (useGpuDiff) {
+                                    cudaError_t copyErr = cudaMemcpy(h_rowSums.data(), d_rowSums, d_rowSumsBytes, cudaMemcpyDeviceToHost);
+                                    if (copyErr != cudaSuccess) {
+                                        std::cerr << "[entry-warn] cudaMemcpy row sums failed: " << cudaGetErrorString(copyErr) << "\n";
+                                        useGpuDiff = false;
+                                    }
+                                }
+
+                                if (useGpuDiff) {
+                                    double mean = 0.0;
+                                    int bestRowIdx = 0;
+
+                                    if (targetRowY >= 0) {
+                                        const int y0 = targetRowY;
+                                        const int y1 = (std::min)(tR.h, targetRowY + targetRowH);
+                                        unsigned long long sumBand = 0;
+                                        for (int yy = y0; yy < y1; ++yy) {
+                                            sumBand += static_cast<unsigned long long>(h_rowSums[static_cast<size_t>(yy)]);
+                                        }
+                                        const int bandH = (std::max)(1, y1 - y0);
+                                        mean = static_cast<double>(sumBand) / static_cast<double>(bandW * bandH);
+                                        bestRowIdx = targetRowY;
+                                    } else {
+                                        unsigned long long sum = 0;
+                                        double bestRow = -1.0;
+                                        for (int yy = 0; yy < tR.h; ++yy) {
+                                            const unsigned int rowSum = h_rowSums[static_cast<size_t>(yy)];
+                                            sum += rowSum;
+                                            const double rs = static_cast<double>(rowSum) / static_cast<double>(bandW);
+                                            if (rs > bestRow) { bestRow = rs; bestRowIdx = yy; }
+                                        }
+                                        mean = static_cast<double>(sum) / static_cast<double>(bandW * tR.h);
+                                    }
+
+                                    if (mean > bestChange) {
+                                        bestChange = mean;
+                                        bestChangeFrame = frame.frameIndex;
+
+                                        bestRoi.resize(roiBytes);
+                                        cudaMemcpy(bestRoi.data(), d_prevRoi, roiBytes, cudaMemcpyDeviceToHost);
+
+                                        bestRoiX = tR.x;
+                                        bestRoiY = tR.y;
+                                        bestRoiW = tR.w;
+                                        bestRoiH = tR.h;
+                                        bestRoiNext.clear();
+                                        bestRoiNextW = 0;
+                                        bestRoiNextH = 0;
+                                        bestRoiNext2.clear();
+                                        bestRoiNext2W = 0;
+                                        bestRoiNext2H = 0;
+                                        captureNextRoi = true;
+                                        bestRowY = bestRowIdx;
+                                    }
+
+                                    if (captureNextRoi && frame.frameIndex == bestChangeFrame + 1) {
+                                        bestRoiNext.resize(roiBytes);
+                                        cudaMemcpy(bestRoiNext.data(), d_prevRoi, roiBytes, cudaMemcpyDeviceToHost);
+                                        bestRoiNextW = tR.w;
+                                        bestRoiNextH = tR.h;
+                                    } else if (captureNextRoi && frame.frameIndex == bestChangeFrame + 2) {
+                                        bestRoiNext2.resize(roiBytes);
+                                        cudaMemcpy(bestRoiNext2.data(), d_prevRoi, roiBytes, cudaMemcpyDeviceToHost);
+                                        bestRoiNext2W = tR.w;
+                                        bestRoiNext2H = tR.h;
+                                        captureNextRoi = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!useGpuDiff) {
+                            std::vector<uint8_t> roiNow(static_cast<size_t>(tR.w) * static_cast<size_t>(tR.h));
                             for (int yy = 0; yy < tR.h; ++yy) {
-                                double rs = 0.0;
-                                const size_t off = static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
-                                for (int xx = 0; xx < tR.w; ++xx) {
-                                    const int d = std::abs((int)roiNow[off + xx] - (int)prevRoi[off + xx]);
-                                    rs += d;
-                                    sum += d;
+                                const uint8_t* src = gray.data() + static_cast<size_t>(tR.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
+                                uint8_t* dst = roiNow.data() + static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                                std::memcpy(dst, src, static_cast<size_t>(tR.w));
+                            }
+
+                            if (captureNextRoi && frame.frameIndex == bestChangeFrame + 1) {
+                                bestRoiNext = roiNow;
+                                bestRoiNextW = tR.w;
+                                bestRoiNextH = tR.h;
+                            } else if (captureNextRoi && frame.frameIndex == bestChangeFrame + 2) {
+                                bestRoiNext2 = roiNow;
+                                bestRoiNext2W = tR.w;
+                                bestRoiNext2H = tR.h;
+                                captureNextRoi = false;
+                            }
+
+                            if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
+                                double mean = 0.0;
+                                int bestRowIdx = 0;
+
+                                if (targetRowY >= 0) {
+                                    const int y0 = targetRowY;
+                                    const int y1 = (std::min)(tR.h, targetRowY + targetRowH);
+                                    double sumBand = 0.0;
+                                    for (int yy = y0; yy < y1; ++yy) {
+                                        const size_t off = static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                                        for (int xx = bandX0; xx < bandX1; ++xx) {
+                                            sumBand += std::abs((int)roiNow[off + xx] - (int)prevRoi[off + xx]);
+                                        }
+                                    }
+                                    const int bandH = (std::max)(1, y1 - y0);
+                                    mean = sumBand / (double)(bandW * bandH);
+                                    bestRowIdx = targetRowY;
+                                } else {
+                                    double sum = 0.0;
+                                    double bestRow = -1.0;
+                                    for (int yy = 0; yy < tR.h; ++yy) {
+                                        double rs = 0.0;
+                                        const size_t off = static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                                        for (int xx = bandX0; xx < bandX1; ++xx) {
+                                            const int d = std::abs((int)roiNow[off + xx] - (int)prevRoi[off + xx]);
+                                            rs += d;
+                                            sum += d;
+                                        }
+                                        rs /= (double)bandW;
+                                        if (rs > bestRow) { bestRow = rs; bestRowIdx = yy; }
+                                    }
+                                    mean = sum / (double)(bandW * tR.h);
                                 }
-                                rs /= (double)tR.w;
-                                if (rs > bestRow) { bestRow = rs; bestRowIdx = yy; }
-                            }
-                            const double mean = sum / (double)roiNow.size();
 
-                            const bool rowMatchesTarget = (targetRowY < 0)
-                                || (bestRowIdx >= targetRowY && bestRowIdx < (targetRowY + targetRowH));
-
-                            if (rowMatchesTarget && mean > bestChange) {
-                                bestChange = mean;
-                                bestChangeFrame = frame.frameIndex;
-                                bestRoi = roiNow;
-                                bestRoiW = tR.w;
-                                bestRoiH = tR.h;
-                                bestRoiNext.clear();
-                                bestRoiNextW = 0;
-                                bestRoiNextH = 0;
-                                bestRoiNext2.clear();
-                                bestRoiNext2W = 0;
-                                bestRoiNext2H = 0;
-                                captureNextRoi = true;
-                                bestRowY = bestRowIdx;
+                                if (mean > bestChange) {
+                                    bestChange = mean;
+                                    bestChangeFrame = frame.frameIndex;
+                                    bestRoi = roiNow;
+                                    bestRoiX = tR.x;
+                                    bestRoiY = tR.y;
+                                    bestRoiW = tR.w;
+                                    bestRoiH = tR.h;
+                                    bestRoiNext.clear();
+                                    bestRoiNextW = 0;
+                                    bestRoiNextH = 0;
+                                    bestRoiNext2.clear();
+                                    bestRoiNext2W = 0;
+                                    bestRoiNext2H = 0;
+                                    captureNextRoi = true;
+                                    bestRowY = bestRowIdx;
+                                }
                             }
+
+                            prevRoi.swap(roiNow);
                         }
-
-                        prevRoi.swap(roiNow);
                     }
                 }
 
@@ -1714,6 +1986,15 @@ int main(int argc, char* argv[]) {
                 }
 
                 continue;
+            }
+
+            if (d_prevRoi) {
+                cudaFree(d_prevRoi);
+                d_prevRoi = nullptr;
+            }
+            if (d_rowSums) {
+                cudaFree(d_rowSums);
+                d_rowSums = nullptr;
             }
 
             if (detectPanels && ((count - 1) % static_cast<uint64_t>(panelEveryN) == 0)) {
@@ -1903,10 +2184,50 @@ int main(int argc, char* argv[]) {
                     }
 #endif
                 } else {
+                    uint64_t presentFirstFrame = bestChangeFrame;
+                    const float ocrPresentThresh = 0.60f;
+                    if (bestChangeFrame > 0 && bestRoiW > 0 && bestRoiH > 0) {
+                        const int scanStart = (bestChangeFrame > 3) ? (int)(bestChangeFrame - 3) : 0;
+                        const int scanEnd = (int)(bestChangeFrame + 6);
+                        trading_monitor::video::MFSourceReaderDecoder decScan;
+                        std::string errScan;
+                        if (decScan.open(fs::path(resolved).wstring(), errScan)) {
+                            trading_monitor::video::VideoFrameY frScan;
+                            while (decScan.readFrame(frScan, errScan)) {
+                                const int idx = (int)frScan.frameIndex;
+                                if (idx < scanStart) continue;
+                                if (idx > scanEnd) break;
+                                std::vector<uint8_t> grayScan(static_cast<size_t>(frScan.width) * static_cast<size_t>(frScan.height));
+                                for (int y = 0; y < frScan.height; ++y) {
+                                    const uint8_t* srcRow = frScan.y.data() + static_cast<size_t>(y) * static_cast<size_t>(frScan.strideY);
+                                    uint8_t* dstRow = grayScan.data() + static_cast<size_t>(y) * static_cast<size_t>(frScan.width);
+                                    std::memcpy(dstRow, srcRow, static_cast<size_t>(frScan.width));
+                                }
+                                trading_monitor::ROI scanRoi{"scan", bestRoiX, bestRoiY, bestRoiW, bestRoiH};
+                                scanRoi = clampROIToFrame(scanRoi, frScan.width, frScan.height);
+                                std::vector<uint8_t> roiScan(static_cast<size_t>(scanRoi.w) * static_cast<size_t>(scanRoi.h));
+                                for (int yy = 0; yy < scanRoi.h; ++yy) {
+                                    const uint8_t* src = grayScan.data() + static_cast<size_t>(scanRoi.y + yy) * static_cast<size_t>(frScan.width) + static_cast<size_t>(scanRoi.x);
+                                    uint8_t* dst = roiScan.data() + static_cast<size_t>(yy) * static_cast<size_t>(scanRoi.w);
+                                    std::memcpy(dst, src, static_cast<size_t>(scanRoi.w));
+                                }
+                                trading_monitor::detect::GlyphOCRResult scanOcr;
+                                std::vector<uint8_t> scanRowPatch;
+                                int scanRowW = 0;
+                                int scanRowH = 0;
+                                runOcrOnRoi(roiScan, scanRoi.w, scanRoi.h, scanOcr, scanRowPatch, scanRowW, scanRowH);
+                                if (!scanOcr.text.empty() && tgt.rfind(scanOcr.text, 0) == 0 && scanOcr.score >= ocrPresentThresh) {
+                                    presentFirstFrame = frScan.frameIndex;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     const double fps = dec.fps();
-                    const uint64_t absentF = (bestChangeFrame > 0) ? (bestChangeFrame - 1) : 0;
+                    const uint64_t absentF = (presentFirstFrame > 0) ? (presentFirstFrame - 1) : 0;
                     const double absentMs = 1000.0 * (double)absentF / (fps > 0.0 ? fps : 30.0);
-                    const double presentMs = 1000.0 * (double)bestChangeFrame / (fps > 0.0 ? fps : 30.0);
+                    const double presentMs = 1000.0 * (double)presentFirstFrame / (fps > 0.0 ? fps : 30.0);
 
                     std::cout << "[entry-change-ocr] " << tgt
                               << " window_ms=(" << absentMs << "," << presentMs << "]"
