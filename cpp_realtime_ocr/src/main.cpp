@@ -48,6 +48,7 @@
 #include "detection/panel_finder.h"
 #include "detection/symbol_matcher.h"
 #include "detection/entry_trigger.h"
+#include "detection/glyph_ocr.h"
 #include "detection/trigger_roi_builder.h"
 #include "detection/yolo_detector.h"
 #include "ocr/ctc_decoder.h"
@@ -265,6 +266,8 @@ void printUsage(const char* programName) {
               << "Options:\n"
               << "  --video <path>     Offline mode: decode frames from MP4 (Media Foundation) and exit\n"
               << "  --video-max-frames <n>  Offline mode: decode at most N frames (0 = until EOF)\n"
+              << "  --start-frame <n>  Offline mode: skip frames before N\n"
+              << "  --end-frame <n>    Offline mode: stop after N (inclusive)\n"
               << "  --detect-panels    Offline mode (with --video): run panel header template matching\n"
               << "  --panel-template-dir <path>  Panel header templates dir (default: templates/headers)\n"
               << "  --panel-threshold <f>  Min NCC score for header match (default: 0.65)\n"
@@ -927,6 +930,8 @@ int main(int argc, char* argv[]) {
     // Offline MP4 input (Media Foundation)
     std::string videoPath;
     int videoMaxFrames = 0; // 0 = decode until EOF
+    int videoStartFrame = 0;
+    int videoEndFrame = -1;
 
     // Entry-trigger mode (timing-first)
     std::string modeStr = "panel-detect"; // panel-detect | entry-trigger
@@ -1004,6 +1009,10 @@ int main(int argc, char* argv[]) {
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             return 0;
+        } else if (arg == "--start-frame" && i + 1 < argc) {
+            videoStartFrame = (std::max)(0, std::stoi(argv[++i]));
+        } else if (arg == "--end-frame" && i + 1 < argc) {
+            videoEndFrame = std::stoi(argv[++i]);
         } else if (arg == "--video" && i + 1 < argc) {
             videoPath = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
@@ -1259,16 +1268,13 @@ int main(int argc, char* argv[]) {
         trading_monitor::track::TrackerConfig trackCfg;
         trading_monitor::Profiler profiler(enableProfile);
         uint64_t lastTrigBuildFrame = 0;
-        float bestChange = -1.0f;
+        double bestChange = -1.0;
         uint64_t bestChangeFrame = 0;
-        double bestChangeTimeMs = 0.0;
-        trading_monitor::ROI bestChangeRoi{};
-        int bestChangeRowY = 0;
-        int bestChangeRowH = 0;
-        bool bestChangeRowValid = false;
-        std::vector<uint8_t> bestChangeFrameGray;
-        std::vector<uint8_t> bestChangeNextGray;
-        bool captureNext = false;
+        int bestRowY = 0;
+        int bestRoiW = 0;
+        int bestRoiH = 0;
+        std::vector<uint8_t> prevRoi;
+        std::vector<uint8_t> bestRoi;
         float bestSymFullScore = -1.0f;
         uint64_t bestSymFullFrame = 0;
         float bestSymTrigScore = -1.0f;
@@ -1281,13 +1287,6 @@ int main(int argc, char* argv[]) {
         uint64_t symPresentFirstFrame = 0;
         uint64_t symEventFrame = 0;
         bool symEventSet = false;
-        float bestCoarseChange = -1.0f;
-        uint64_t bestCoarseFrame = 0;
-        double bestCoarseTimeMs = 0.0;
-        bool havePrevCoarse = false;
-        std::vector<uint8_t> prevTrigCoarse;
-        int prevTrigCoarseW = 0;
-        int prevTrigCoarseH = 0;
         bool usedFullFrameSym = false;
         const bool useSymbolGate = false;
 
@@ -1336,10 +1335,18 @@ int main(int argc, char* argv[]) {
             if (entryTriggerMode) {
                 profiler.beginFrame(frame.frameIndex);
 
+                if ((int)frame.frameIndex < videoStartFrame) {
+                    profiler.endFrame();
+                    continue;
+                }
+                if (videoEndFrame >= 0 && (int)frame.frameIndex > videoEndFrame) {
+                    break;
+                }
+
                 // Match Python header search parameters
                 panelCfg.maxSearchW = 0.0f;
                 panelCfg.scales = {0.80f, 0.90f, 1.00f, 1.10f};
-                panelCfg.hdrThreshold = 0.55f;
+                panelCfg.hdrThreshold = panelThreshold;
                 panelCfg.detectOrder = false;
                 panelCfg.detectQuote = false;
                 trackCfg.minTrackScore = (std::max)(0.40f, panelCfg.hdrThreshold - 0.05f);
@@ -1493,7 +1500,7 @@ int main(int argc, char* argv[]) {
                                 usedFullFrameSym = true;
                             }
                         }
-                        havePrevCoarse = false;
+                        prevRoi.clear();
                         symPresentCount = 0;
                         trackAge = 0;
                         havePanel = false;
@@ -1519,7 +1526,7 @@ int main(int argc, char* argv[]) {
                             havePanel = false;
                             trackFailCount = 0;
                         }
-                        havePrevCoarse = false;
+                        prevRoi.clear();
                         symPresentCount = 0;
                         trackAge = 0;
                         printProgress();
@@ -1557,85 +1564,48 @@ int main(int argc, char* argv[]) {
                 trigScore = symLocTrig.found ? symLocTrig.score : -1.0f;
                 profiler.markMatch(trigScore);
 
-                // Coarse change-peak on trigger ROI (row-constrained when symbol row is known)
-                {
-                    const trading_monitor::ROI changeRoi = trigRoi.triggerRoi;
-                    const int rx = (std::max)(0, (std::min)(changeRoi.x, frame.width - 1));
-                    const int ry = (std::max)(0, (std::min)(changeRoi.y, frame.height - 1));
-                    const int rw = (std::max)(1, (std::min)(changeRoi.w, frame.width - rx));
-                    const int rh = (std::max)(1, (std::min)(changeRoi.h, frame.height - ry));
-                    std::vector<uint8_t> trigCrop((size_t)rw * (size_t)rh);
-                    for (int y = 0; y < rh; ++y) {
-                        const uint8_t* srcRow = gray.data() + (size_t)(ry + y) * (size_t)frame.width + (size_t)rx;
-                        uint8_t* dstRow = trigCrop.data() + (size_t)y * (size_t)rw;
-                        std::memcpy(dstRow, srcRow, (size_t)rw);
-                    }
-                    if (havePrevCoarse && prevTrigCoarseW == rw && prevTrigCoarseH == rh) {
-                        float ch = -1.0f;
-                        int rowY = 0;
-                        int rowH = 32;
-                        if (symLocTrig.found) {
-                            rowY = (std::max)(0, symLocTrig.y - changeRoi.y - 4);
-                            rowH = (std::min)(40, rh - rowY);
-                            if (rowH > 0) {
-                                double sum = 0.0;
-                                for (int y = 0; y < rowH; ++y) {
-                                    const uint8_t* nowRow = trigCrop.data() + (size_t)(rowY + y) * (size_t)rw;
-                                    const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)(rowY + y) * (size_t)rw;
-                                    for (int x = 0; x < rw; ++x) {
-                                        sum += std::abs((int)nowRow[x] - (int)prevRow[x]);
-                                    }
-                                }
-                                ch = (float)(sum / (double)(rw * rowH));
-                            }
-                        } else {
-                            std::vector<float> rowScores((size_t)rh, 0.0f);
-                            for (int y = 0; y < rh; ++y) {
-                                const uint8_t* nowRow = trigCrop.data() + (size_t)y * (size_t)rw;
-                                const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)y * (size_t)rw;
-                                double sumRow = 0.0;
-                                for (int x = 0; x < rw; ++x) {
-                                    sumRow += std::abs((int)nowRow[x] - (int)prevRow[x]);
-                                }
-                                rowScores[(size_t)y] = (float)(sumRow / (double)rw);
-                            }
-                            int bestRow = 0;
-                            float bestVal = rowScores.empty() ? 0.0f : rowScores[0];
-                            for (int y = 1; y < rh; ++y) {
-                                const float v = rowScores[(size_t)y];
-                                if (v > bestVal) { bestVal = v; bestRow = y; }
-                            }
-                            rowH = (std::min)(32, rh);
-                            rowY = (std::max)(0, bestRow - rowH / 2);
-                            rowH = (std::min)(rowH, rh - rowY);
-                            double sum = 0.0;
-                            for (int y = 0; y < rowH; ++y) {
-                                const uint8_t* nowRow = trigCrop.data() + (size_t)(rowY + y) * (size_t)rw;
-                                const uint8_t* prevRow = prevTrigCoarse.data() + (size_t)(rowY + y) * (size_t)rw;
-                                for (int x = 0; x < rw; ++x) {
-                                    sum += std::abs((int)nowRow[x] - (int)prevRow[x]);
-                                }
-                            }
-                            ch = (float)(sum / (double)(rw * rowH));
+                // Update change-peak on trigger ROI (Python parity)
+                if (trigRoi.ok) {
+                    const trading_monitor::ROI& tR = trigRoi.triggerRoi;
+                    if (tR.w > 0 && tR.h > 0 && tR.x >= 0 && tR.y >= 0 &&
+                        (tR.x + tR.w) <= frame.width && (tR.y + tR.h) <= frame.height) {
+
+                        std::vector<uint8_t> roiNow(static_cast<size_t>(tR.w) * static_cast<size_t>(tR.h));
+                        for (int yy = 0; yy < tR.h; ++yy) {
+                            const uint8_t* src = gray.data() + static_cast<size_t>(tR.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
+                            uint8_t* dst = roiNow.data() + static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                            std::memcpy(dst, src, static_cast<size_t>(tR.w));
                         }
 
-                        if (ch > bestCoarseChange) {
-                            bestCoarseChange = ch;
-                            bestCoarseFrame = frame.frameIndex;
-                            bestCoarseTimeMs = frameTimeMs;
-                            bestChange = ch;
-                            bestChangeFrame = frame.frameIndex;
-                            bestChangeTimeMs = frameTimeMs;
-                            bestChangeRoi = changeRoi;
-                            bestChangeRowY = rowY;
-                            bestChangeRowH = rowH;
-                            bestChangeRowValid = (rowH > 0);
+                        if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
+                            double sum = 0.0;
+                            for (size_t i = 0; i < roiNow.size(); ++i) {
+                                sum += std::abs((int)roiNow[i] - (int)prevRoi[i]);
+                            }
+                            const double mean = sum / (double)roiNow.size();
+                            if (mean > bestChange) {
+                                bestChange = mean;
+                                bestChangeFrame = frame.frameIndex;
+                                bestRoi = roiNow;
+                                bestRoiW = tR.w;
+                                bestRoiH = tR.h;
+
+                                double bestRow = -1.0;
+                                int bestY = 0;
+                                for (int yy = 0; yy < tR.h; ++yy) {
+                                    double rs = 0.0;
+                                    const size_t off = static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                                    for (int xx = 0; xx < tR.w; ++xx) {
+                                        rs += std::abs((int)roiNow[off + xx] - (int)prevRoi[off + xx]);
+                                    }
+                                    rs /= (double)tR.w;
+                                    if (rs > bestRow) { bestRow = rs; bestY = yy; }
+                                }
+                                bestRowY = bestY;
+                            }
                         }
+                        prevRoi.swap(roiNow);
                     }
-                    prevTrigCoarse = std::move(trigCrop);
-                    prevTrigCoarseW = rw;
-                    prevTrigCoarseH = rh;
-                    havePrevCoarse = true;
                 }
 
                 if (useSymbolGate) {
@@ -1745,356 +1715,54 @@ int main(int argc, char* argv[]) {
         if (entryTriggerMode) {
             profiler.flush(profileJsonPath, profileSummaryPath);
 
-            // Prefer trigger-ROI symbol peak; fallback to full-frame search if missing
-            if (!usedFullFrameSym && bestSymTrigFrame > 0) {
-                bestSymFullFrame = bestSymTrigFrame;
-                bestSymFullScore = bestSymTrigScore;
-            } else if (!usedFullFrameSym && trackHeaderMode && !targetSymbol.empty()) {
-                trading_monitor::video::MFSourceReaderDecoder decFull;
-                std::string errFull;
-                if (decFull.open(fs::path(resolved).wstring(), errFull)) {
-                    trading_monitor::video::VideoFrameY frFull;
-                    float bestFullScore = -1.0f;
-                    uint64_t bestFullFrame = 0;
-                    while (decFull.readFrame(frFull, errFull)) {
-                        std::vector<uint8_t> grayF(static_cast<size_t>(frFull.width) * static_cast<size_t>(frFull.height));
-                        for (int y = 0; y < frFull.height; ++y) {
-                            const uint8_t* srcRow = frFull.y.data() + static_cast<size_t>(y) * static_cast<size_t>(frFull.strideY);
-                            uint8_t* dstRow = grayF.data() + static_cast<size_t>(y) * static_cast<size_t>(frFull.width);
-                            std::memcpy(dstRow, srcRow, static_cast<size_t>(frFull.width));
-                        }
-                        trading_monitor::ROI leftRoi{"left", 0, 0, (int)std::lround(frFull.width * 0.50), frFull.height};
-                        auto m = sym.matchInGrayROIWithLoc(grayF, frFull.width, frFull.height, leftRoi);
-                        if (m.found && m.score > bestFullScore) {
-                            bestFullScore = m.score;
-                            bestFullFrame = frFull.frameIndex;
-                        }
-                    }
-                    if (bestFullFrame > 0) {
-                        bestSymFullFrame = bestFullFrame;
-                        bestSymFullScore = bestFullScore;
-                        usedFullFrameSym = true;
-                    }
-                }
-            }
+            if (bestChange >= 0.0 && !bestRoi.empty() && bestRoiW > 0 && bestRoiH > 0) {
+                const int bandH = 32;
+                int y0 = (std::max)(0, bestRowY - bandH / 2);
+                if (y0 + bandH > bestRoiH) y0 = (std::max)(0, bestRoiH - bandH);
 
-            const uint64_t targetFrame = (usedFullFrameSym && bestSymFullFrame > 0) ? bestSymFullFrame
-                : (bestCoarseFrame > 0 ? bestCoarseFrame : symEventFrame);
-            std::cout << "\n[entry-debug] bestCoarseFrame=" << bestCoarseFrame
-                      << " bestCoarseMs=" << std::fixed << std::setprecision(2) << bestCoarseTimeMs
-                      << " symEventFrame=" << symEventFrame
-                      << " bestSymFullFrame=" << bestSymFullFrame
-                      << " bestSymScore=" << std::fixed << std::setprecision(3) << bestSymFullScore
-                      << " targetFrame=" << targetFrame << "\n";
-
-            // Second pass: refine change-peak only if a full-frame symbol search was used (Python behavior)
-            if (usedFullFrameSym && targetFrame > 0) {
-                const int win = 30;
-                const int start = (targetFrame > (uint64_t)win) ? (int)(targetFrame - win) : 0;
-                const int end = (int)(std::min<uint64_t>(count - 1, targetFrame + win));
-
-                trading_monitor::video::MFSourceReaderDecoder dec2;
-                std::string err2;
-                if (dec2.open(fs::path(resolved).wstring(), err2)) {
-                    trading_monitor::video::VideoFrameY fr2;
-                    std::vector<uint8_t> prevGray;
-                    bool havePrev = false;
-                    bestChange = -1.0f;
-                    bestChangeFrame = 0;
-                    bestChangeTimeMs = 0.0;
-                    bestChangeFrameGray.clear();
-                    bestChangeNextGray.clear();
-                    captureNext = false;
-
-                    trading_monitor::ROI band{};
-                    bool bandReady = false;
-                    trading_monitor::ROI roiUnderHeader{};
-                    bool roiReady = false;
-                    float bestChangeBand = -1.0f;
-                    uint64_t bestChangeBandFrame = 0;
-                    double bestChangeBandTimeMs = 0.0;
-                    float bestChangeRow = -1.0f;
-                    uint64_t bestChangeRowFrame = 0;
-                    double bestChangeRowTimeMs = 0.0;
-
-                    while (dec2.readFrame(fr2, err2)) {
-                        const int idx = (int)fr2.frameIndex;
-                        if (idx < start) {
-                            continue;
-                        }
-                        if (idx > end) {
-                            break;
-                        }
-
-                        std::vector<uint8_t> gray2(static_cast<size_t>(fr2.width) * static_cast<size_t>(fr2.height));
-                        for (int y = 0; y < fr2.height; ++y) {
-                            const uint8_t* srcRow = fr2.y.data() + static_cast<size_t>(y) * static_cast<size_t>(fr2.strideY);
-                            uint8_t* dstRow = gray2.data() + static_cast<size_t>(y) * static_cast<size_t>(fr2.width);
-                            std::memcpy(dstRow, srcRow, static_cast<size_t>(fr2.width));
-                        }
-
-                        if (!roiReady && idx == (int)targetFrame) {
-                            const auto found2 = panelFinder.findPanelsFromGray(gray2.data(), fr2.width, fr2.height, panelCfg);
-                            if (found2.hasPositions && found2.positionsHeader.w > 0 && found2.positionsHeader.h > 0) {
-                                roiUnderHeader.name = "trigger_roi";
-                                roiUnderHeader.x = found2.positionsHeader.x;
-                                roiUnderHeader.y = found2.positionsHeader.y + found2.positionsHeader.h + 5;
-                                roiUnderHeader.w = 260;
-                                roiUnderHeader.h = 220;
-                                roiUnderHeader = clampROIToFrame(roiUnderHeader, fr2.width, fr2.height);
-                                roiReady = (roiUnderHeader.w > 0 && roiUnderHeader.h > 0);
-
-                                auto symLoc = sym.matchInGrayROIWithLoc(gray2, fr2.width, fr2.height, roiUnderHeader);
-                                if (symLoc.found) {
-                                    band = trading_monitor::ROI{"sym_band",
-                                        (std::max)(0, symLoc.x - 10),
-                                        (std::max)(0, symLoc.y - 4),
-                                        (std::min)(260, fr2.width - (std::max)(0, symLoc.x - 10)),
-                                        (std::min)(40, fr2.height - (std::max)(0, symLoc.y - 4))
-                                    };
-                                    bandReady = true;
-                                    bestSymBand = band;
-                                }
-                            }
-
-                            if (!bandReady && bestSymBand.w > 0 && bestSymBand.h > 0) {
-                                band = bestSymBand;
-                                bandReady = true;
-                            }
-                        }
-
-                        if (havePrev && bandReady) {
-                            const int rx = (std::max)(0, (std::min)(band.x, fr2.width - 1));
-                            const int ry = (std::max)(0, (std::min)(band.y, fr2.height - 1));
-                            const int rw = (std::max)(1, (std::min)(band.w, fr2.width - rx));
-                            const int rh = (std::max)(1, (std::min)(band.h, fr2.height - ry));
-
-                            double sum = 0.0;
-                            const size_t rowStride = static_cast<size_t>(fr2.width);
-                            for (int y = 0; y < rh; ++y) {
-                                const uint8_t* rowNow = gray2.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                const uint8_t* rowPrev = prevGray.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                for (int x = 0; x < rw; ++x) {
-                                    sum += std::abs((int)rowNow[x] - (int)rowPrev[x]);
-                                }
-                            }
-                            const float ch = (float)(sum / (double)(rw * rh));
-                            if (ch > bestChangeBand) {
-                                bestChangeBand = ch;
-                                bestChangeBandFrame = fr2.frameIndex;
-                                if (dec2.fps() > 0.0) {
-                                    bestChangeBandTimeMs = 1000.0 * (double)fr2.frameIndex / dec2.fps();
-                                } else {
-                                    bestChangeBandTimeMs = (double)fr2.pts100ns / 10000.0;
-                                }
-                            }
-                        } else if (havePrev && roiReady) {
-                            const int rx = (std::max)(0, (std::min)(roiUnderHeader.x, fr2.width - 1));
-                            const int ry = (std::max)(0, (std::min)(roiUnderHeader.y, fr2.height - 1));
-                            const int rw = (std::max)(1, (std::min)(roiUnderHeader.w, fr2.width - rx));
-                            const int rh = (std::max)(1, (std::min)(roiUnderHeader.h, fr2.height - ry));
-
-                            std::vector<float> rowScores((size_t)rh, 0.0f);
-                            const size_t rowStride = static_cast<size_t>(fr2.width);
-                            for (int y = 0; y < rh; ++y) {
-                                const uint8_t* rowNow = gray2.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                const uint8_t* rowPrev = prevGray.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                double sumRow = 0.0;
-                                for (int x = 0; x < rw; ++x) {
-                                    sumRow += std::abs((int)rowNow[x] - (int)rowPrev[x]);
-                                }
-                                rowScores[(size_t)y] = (float)(sumRow / (double)rw);
-                            }
-                            int bestRow = 0;
-                            float bestRowVal = rowScores.empty() ? 0.0f : rowScores[0];
-                            for (int y = 1; y < rh; ++y) {
-                                const float v = rowScores[(size_t)y];
-                                if (v > bestRowVal) { bestRowVal = v; bestRow = y; }
-                            }
-                            const int rowH = (std::min)(32, rh);
-                            const int y0 = (std::max)(0, bestRow - rowH / 2);
-                            const int y1 = (std::min)(rh, y0 + rowH);
-
-                            double sumBand = 0.0;
-                            for (int y = y0; y < y1; ++y) {
-                                const uint8_t* rowNow = gray2.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                const uint8_t* rowPrev = prevGray.data() + (size_t)(ry + y) * rowStride + (size_t)rx;
-                                for (int x = 0; x < rw; ++x) {
-                                    sumBand += std::abs((int)rowNow[x] - (int)rowPrev[x]);
-                                }
-                            }
-                            const float ch = (float)(sumBand / (double)((y1 - y0) * rw));
-                            if (ch > bestChangeRow) {
-                                bestChangeRow = ch;
-                                bestChangeRowFrame = fr2.frameIndex;
-                                if (dec2.fps() > 0.0) {
-                                    bestChangeRowTimeMs = 1000.0 * (double)fr2.frameIndex / dec2.fps();
-                                } else {
-                                    bestChangeRowTimeMs = (double)fr2.pts100ns / 10000.0;
-                                }
-                            }
-                        }
-
-                        if (captureNext && fr2.frameIndex == bestChangeFrame + 1) {
-                            bestChangeNextGray = gray2;
-                            captureNext = false;
-                        }
-
-                        prevGray = std::move(gray2);
-                        havePrev = true;
-                    }
-
-                    // Debug: report band/row peaks around target
-                    std::cout << "[entry-debug] bandPeakFrame=" << bestChangeBandFrame
-                              << " bandPeakMs=" << std::fixed << std::setprecision(2) << bestChangeBandTimeMs
-                              << " rowPeakFrame=" << bestChangeRowFrame
-                              << " rowPeakMs=" << std::fixed << std::setprecision(2) << bestChangeRowTimeMs
-                              << " targetFrame=" << targetFrame << "\n";
-
-                    // Choose the change-peak closest to targetFrame (prefer row-wise if near)
-                    const uint64_t pickBand = bestChangeBandFrame;
-                    const uint64_t pickRow = bestChangeRowFrame;
-                    const bool rowNear = (pickRow > 0) && (std::llabs((long long)pickRow - (long long)targetFrame) <= 5);
-                    if (rowNear || pickBand == 0) {
-                        bestChange = bestChangeRow;
-                        bestChangeFrame = bestChangeRowFrame;
-                        bestChangeTimeMs = bestChangeRowTimeMs;
-                        bestChangeRoi = roiUnderHeader;
-                    } else {
-                        bestChange = bestChangeBand;
-                        bestChangeFrame = bestChangeBandFrame;
-                        bestChangeTimeMs = bestChangeBandTimeMs;
-                        bestChangeRoi = bandReady ? band : roiUnderHeader;
-                    }
-
-                    // Re-read bestChangeFrame (and next) for scoring
-                    if (bestChangeFrame > 0) {
-                        trading_monitor::video::MFSourceReaderDecoder dec3;
-                        std::string err3;
-                        if (dec3.open(fs::path(resolved).wstring(), err3)) {
-                            trading_monitor::video::VideoFrameY fr3;
-                            while (dec3.readFrame(fr3, err3)) {
-                                if (fr3.frameIndex == bestChangeFrame || fr3.frameIndex == bestChangeFrame + 1) {
-                                    std::vector<uint8_t> gray3(static_cast<size_t>(fr3.width) * static_cast<size_t>(fr3.height));
-                                    for (int y = 0; y < fr3.height; ++y) {
-                                        const uint8_t* srcRow = fr3.y.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.strideY);
-                                        uint8_t* dstRow = gray3.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.width);
-                                        std::memcpy(dstRow, srcRow, static_cast<size_t>(fr3.width));
-                                    }
-                                    if (fr3.frameIndex == bestChangeFrame) {
-                                        bestChangeFrameGray = std::move(gray3);
-                                    } else {
-                                        bestChangeNextGray = std::move(gray3);
-                                    }
-                                }
-                                if (fr3.frameIndex > bestChangeFrame + 1) break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If we skipped refinement, still capture the best-change frame for scoring
-            if (bestChangeFrame > 0 && bestChangeFrameGray.empty()) {
-                trading_monitor::video::MFSourceReaderDecoder dec3;
-                std::string err3;
-                if (dec3.open(fs::path(resolved).wstring(), err3)) {
-                    trading_monitor::video::VideoFrameY fr3;
-                    while (dec3.readFrame(fr3, err3)) {
-                        if (fr3.frameIndex == bestChangeFrame || fr3.frameIndex == bestChangeFrame + 1) {
-                            std::vector<uint8_t> gray3(static_cast<size_t>(fr3.width) * static_cast<size_t>(fr3.height));
-                            for (int y = 0; y < fr3.height; ++y) {
-                                const uint8_t* srcRow = fr3.y.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.strideY);
-                                uint8_t* dstRow = gray3.data() + static_cast<size_t>(y) * static_cast<size_t>(fr3.width);
-                                std::memcpy(dstRow, srcRow, static_cast<size_t>(fr3.width));
-                            }
-                            if (fr3.frameIndex == bestChangeFrame) {
-                                bestChangeFrameGray = std::move(gray3);
-                            } else {
-                                bestChangeNextGray = std::move(gray3);
-                            }
-                        }
-                        if (fr3.frameIndex > bestChangeFrame + 1) break;
-                    }
-                }
-            }
-
-            if (bestChangeFrame > 0 && bestChangeRoi.w > 0 && bestChangeRoi.h > 0) {
-                const auto& useGray = !bestChangeNextGray.empty() ? bestChangeNextGray : bestChangeFrameGray;
-                float scoreAtChange = -1.0f;
-                if (!useGray.empty()) {
-                    scoreAtChange = sym.matchInGrayROI(useGray, frame.width, frame.height, bestChangeRoi);
-                }
-#if defined(TM_USE_OPENCV)
-                bool ocrOk = true;
-                std::string ocrText;
-                float ocrScore = -1.0f;
-                float wordScore = -1.0f;
-                float tplScore = -1.0f;
-
-                if (!useGray.empty()) {
-                    cv::Mat frameMat(dec.height(), dec.width(), CV_8UC1, (void*)useGray.data());
-                    cv::Rect roiRect(bestChangeRoi.x, bestChangeRoi.y, bestChangeRoi.w, bestChangeRoi.h);
-                    roiRect = roiRect & cv::Rect(0, 0, frameMat.cols, frameMat.rows);
-                    if (roiRect.width > 0 && roiRect.height > 0) {
-                        cv::Mat roi = frameMat(roiRect).clone();
-
-                        int baseY = bestChangeRowValid ? bestChangeRowY : 0;
-                        OcrResult bestOcr;
-                        cv::Mat bestRowPatch;
-                        for (int rowH : {28, 32, 36}) {
-                            for (int off : {-8, -4, 0, 4, 8}) {
-                                int y0 = (std::max)(0, baseY + off - rowH / 2);
-                                int y1 = (std::min)(roi.rows, y0 + rowH);
-                                if (y1 <= y0) continue;
-                                cv::Mat rowPatch = roi(cv::Rect(0, y0, roi.cols, y1 - y0));
-                                auto res = ocrRowSymbol(rowPatch);
-                                if (res.score > bestOcr.score) {
-                                    bestOcr = res;
-                                    bestRowPatch = rowPatch.clone();
-                                }
-                            }
-                        }
-                        ocrText = bestOcr.text;
-                        ocrScore = bestOcr.score;
-                        if (ocrText.empty() || ocrText.rfind(targetSymbol, 0) != 0) {
-                            ocrOk = false;
-                        }
-
-                        if (!ocrOk) {
-                            int y0 = (std::max)(0, baseY - 14);
-                            int y1 = (std::min)(roi.rows, y0 + 28);
-                            if (y1 > y0) {
-                                cv::Mat wordPatch = roi(cv::Rect(0, y0, roi.cols, y1 - y0));
-                                wordScore = matchWordScore(wordPatch, targetSymbol);
-                                trading_monitor::ROI wordRoi{"word", bestChangeRoi.x, bestChangeRoi.y + y0, bestChangeRoi.w, y1 - y0};
-                                tplScore = sym.matchInGrayROI(useGray, frame.width, frame.height, wordRoi);
-                                if (wordScore >= 0.50f || tplScore >= 0.55f) {
-                                    ocrOk = true;
-                                    ocrText = targetSymbol;
-                                    ocrScore = (std::max)(wordScore, tplScore);
-                                }
-                            }
-                        }
-                    }
+                std::vector<uint8_t> rowBand(static_cast<size_t>(bestRoiW) * static_cast<size_t>(bandH));
+                for (int yy = 0; yy < bandH; ++yy) {
+                    std::memcpy(rowBand.data() + static_cast<size_t>(yy) * static_cast<size_t>(bestRoiW),
+                                bestRoi.data() + static_cast<size_t>(y0 + yy) * static_cast<size_t>(bestRoiW),
+                                static_cast<size_t>(bestRoiW));
                 }
 
-                if (!ocrOk) {
-                    std::cout << "\n[entry-ocr] mismatch target=" << targetSymbol
-                              << " ocr='" << ocrText << "' ocrScore=" << std::fixed << std::setprecision(3) << ocrScore
-                              << " wordScore=" << std::fixed << std::setprecision(3) << wordScore
-                              << " tplScore=" << std::fixed << std::setprecision(3) << tplScore << "\n";
-                    return 1;
+                std::cout << "[entry-debug] bestChangeFrame=" << bestChangeFrame
+                          << " bestChange=" << bestChange
+                          << " bestRowY=" << bestRowY
+                          << " bandY0=" << y0
+                          << " bandH=" << bandH
+                          << " roiW=" << bestRoiW
+                          << " roiH=" << bestRoiH << "\n";
+
+                static bool dumpedBand = false;
+                if (!dumpedBand) {
+                    const std::wstring bandPath = L"debug_row_band.png";
+                    if (writePNGGray8(bandPath, rowBand.data(), bestRoiW, bandH)) {
+                        std::wcerr << L"Wrote " << bandPath << L"\n";
+                    }
+                    dumpedBand = true;
                 }
-#endif
-                const double absentMs = (dec.fps() > 0.0) ? (1000.0 * (double)(bestChangeFrame - 1) / dec.fps())
-                                                        : (bestChangeTimeMs - (1000.0 / 30.0));
-                std::cout << "\n[entry-change] " << targetSymbol
-                          << " window_ms=(" << std::fixed << std::setprecision(2)
-                          << absentMs << "," << bestChangeTimeMs << "]"
-                          << " change=" << std::fixed << std::setprecision(3) << bestChange
-                          << " score=" << std::fixed << std::setprecision(3) << scoreAtChange
-                          << " frame=" << bestChangeFrame << "\n";
+
+                auto ocr = trading_monitor::detect::ocrTickerFromRowGray(rowBand, bestRoiW, bandH);
+                const std::string tgt = targetSymbol;
+                const bool ok = (!ocr.text.empty() && tgt.rfind(ocr.text, 0) == 0) || (ocr.text.find(tgt) != std::string::npos);
+                if (!ok) {
+                    std::cerr << "[entry-ocr] mismatch target=" << tgt
+                              << " ocr='" << ocr.text << "' ocrScore=" << ocr.score << std::endl;
+                } else {
+                    const double fps = dec.fps();
+                    const uint64_t absentF = (bestChangeFrame > 0) ? (bestChangeFrame - 1) : 0;
+                    const double absentMs = 1000.0 * (double)absentF / (fps > 0.0 ? fps : 30.0);
+                    const double presentMs = 1000.0 * (double)bestChangeFrame / (fps > 0.0 ? fps : 30.0);
+
+                    std::cout << "[entry-change-ocr] " << tgt
+                              << " window_ms=(" << absentMs << "," << presentMs << "]"
+                              << " change=" << bestChange
+                              << " frame=" << bestChangeFrame
+                              << " ocr='" << ocr.text << "' score=" << ocr.score
+                              << std::endl;
+                }
             }
         }
 

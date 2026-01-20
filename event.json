@@ -1,25 +1,21 @@
 {
-  "target": "APVO",
   "video": "C:\\Users\\forfr\\Downloads\\trade\\trade1_first_10s.mp4",
   "fps": 30.0,
   "event": {
-    "absent_last_frame": 0,
-    "absent_last_time_ms": 0.0,
-    "present_first_frame": 0,
-    "present_first_time_ms": 0.0,
+    "target": "APVO",
+    "method": "change_peak_ocr",
+    "absent_last_frame": 161,
+    "present_first_frame": 162,
+    "absent_last_time_ms": 5366.666666666667,
+    "present_first_time_ms": 5400.0,
     "window_ms": [
-      0.0,
-      0.0
-    ]
-  },
-  "thresholds": {
-    "header": 0.3,
-    "symbol": 0.5
-  },
-  "templates": {
-    "header": "C:\\Users\\forfr\\Downloads\\trade\\templates_auto\\headers\\positions_hdr.png",
-    "symbols": [
-      "C:\\Users\\forfr\\Downloads\\trade\\templates_auto\\symbols\\APVO_0.png"
-    ]
+      5366.666666666667,
+      5400.0
+    ],
+    "best_change": 4.0883653846153845,
+    "best_symbol_score": 0.6421193480491638,
+    "best_symbol_frame": 170,
+    "ocr_text": "APVO",
+    "ocr_score": 0.6385712623596191
   }
 }
