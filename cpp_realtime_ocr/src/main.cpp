@@ -1530,6 +1530,8 @@ roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
 
                 // Compute stream ROI once (Python-like left 70% + content mask)
                 static bool streamRoiInit = false;
+                static uint64_t lastPanelFindFrame = 0;
+                const uint64_t panelFindEveryN = 3; // throttle expensive full search until panel locks
                 static trading_monitor::ROI streamRoi{};
                 if (!streamRoiInit) {
                     const int W = frame.width;
@@ -1570,6 +1572,14 @@ roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
 
                 const bool needReacquire = trackHeaderMode && trackReacquireEvery > 0 && trackAge >= trackReacquireEvery;
                 if (!trackHeaderMode || !havePanel || needReacquire) {
+                    // Throttle full search until we have a panel lock
+                    if (!havePanel && trackHeaderMode) {
+                        if (frame.frameIndex != 0 && (frame.frameIndex - lastPanelFindFrame) < panelFindEveryN) {
+                            std::cerr << ">>> panel find skip frame=" << frame.frameIndex << "\n" << std::flush;
+                            continue;
+                        }
+                        lastPanelFindFrame = frame.frameIndex;
+                    }
                     auto t0 = std::chrono::high_resolution_clock::now();
                     std::cerr << ">>> panel find start frame=" << frame.frameIndex << "\n" << std::flush;
 
@@ -2110,18 +2120,19 @@ if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
                             if (y1 <= y0) continue;
                             const int h = y1 - y0;
 
-                            std::vector<uint8_t> rowPatch(static_cast<size_t>(roiW) * static_cast<size_t>(h));
+                            const int ocrW = (std::min)(roiW, 90);
+                            std::vector<uint8_t> rowPatch(static_cast<size_t>(ocrW) * static_cast<size_t>(h));
                             for (int yy = 0; yy < h; ++yy) {
-                                std::memcpy(rowPatch.data() + static_cast<size_t>(yy) * static_cast<size_t>(roiW),
+                                std::memcpy(rowPatch.data() + static_cast<size_t>(yy) * static_cast<size_t>(ocrW),
                                             roi.data() + static_cast<size_t>(y0 + yy) * static_cast<size_t>(roiW),
-                                            static_cast<size_t>(roiW));
+                                            static_cast<size_t>(ocrW));
                             }
 
-                            auto ocr = trading_monitor::detect::ocrTickerFromRowGray(rowPatch, roiW, h);
+                            auto ocr = trading_monitor::detect::ocrTickerFromRowGray(rowPatch, ocrW, h);
                             if (ocr.score > outOcr.score) {
                                 outOcr = ocr;
                                 outRowPatch = std::move(rowPatch);
-                                outRowW = roiW;
+                                outRowW = ocrW;
                                 outRowH = h;
                             }
                         }
@@ -2239,8 +2250,13 @@ if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
                     uint64_t presentFirstFrame = bestChangeFrame;
                     const float ocrPresentThresh = 0.60f;
                     if (bestChangeFrame > 0 && bestRoiW > 0 && bestRoiH > 0) {
-                        const int scanStart = (std::max)(histStartF, (int)bestChangeFrame + 1);
+                        const int scanStart = (std::max)(histStartF, (int)bestChangeFrame - 2);
                         const int scanEnd = (std::min)(histEndF, (int)bestChangeFrame + 10);
+                        bool foundPresent = false;
+                        float bestScanScore = -1.0f;
+                        uint64_t bestScanFrame = presentFirstFrame;
+                        float bestScanScoreAfter = -1.0f;
+                        uint64_t bestScanFrameAfter = presentFirstFrame;
                         for (int idx = scanStart; idx <= scanEnd; ++idx) {
                             const size_t hidx = static_cast<size_t>(idx - histStartF);
                             if (hidx >= roiHistory.size()) continue;
@@ -2251,19 +2267,33 @@ if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
                             int scanRowW = 0;
                             int scanRowH = 0;
                             runOcrOnRoi(roiScan, bestRoiW, bestRoiH, scanOcr, scanRowPatch, scanRowW, scanRowH);
-                            float scanWordScore = -1.0f;
-#if defined(TM_USE_OPENCV)
-                            if (!scanRowPatch.empty() && scanRowW > 0 && scanRowH > 0) {
-                                cv::Mat rowMat(scanRowH, scanRowW, CV_8UC1, (void*)scanRowPatch.data());
-                                scanWordScore = matchWordScore(rowMat, tgt);
+                            if (scanOcr.text == tgt && scanOcr.score > bestScanScore) {
+                                bestScanScore = scanOcr.score;
+                                bestScanFrame = static_cast<uint64_t>(idx);
                             }
-#endif
-                            const bool ocrOk = (!scanOcr.text.empty() && tgt.rfind(scanOcr.text, 0) == 0 && scanOcr.score >= ocrPresentThresh);
-                            const bool wordOk = (scanWordScore >= 0.50f);
-                            if (ocrOk || wordOk) {
+                            if (scanOcr.text == tgt && idx >= (int)bestChangeFrame + 2 && scanOcr.score > bestScanScoreAfter) {
+                                bestScanScoreAfter = scanOcr.score;
+                                bestScanFrameAfter = static_cast<uint64_t>(idx);
+                            }
+                            const bool ocrOk = (scanOcr.text == tgt && scanOcr.score >= ocrPresentThresh && idx >= (int)bestChangeFrame + 2);
+                            if (ocrOk) {
                                 presentFirstFrame = static_cast<uint64_t>(idx);
+                                foundPresent = true;
                                 break;
                             }
+                        }
+                        if (!foundPresent) {
+                            if (bestScanScoreAfter >= 0.0f) {
+                                presentFirstFrame = bestScanFrameAfter;
+                            } else if (bestScanScore >= 0.0f) {
+                                presentFirstFrame = bestScanFrame;
+                            } else if (bestChangeFrame + 2 <= (uint64_t)histEndF) {
+                                presentFirstFrame = bestChangeFrame + 2;
+                            }
+                            std::cout << "[entry-debug] refine fallback bestAfterFrame=" << bestScanFrameAfter
+                                      << " bestAfterScore=" << bestScanScoreAfter
+                                      << " bestAnyFrame=" << bestScanFrame
+                                      << " bestAnyScore=" << bestScanScore << "\n";
                         }
                     }
 
