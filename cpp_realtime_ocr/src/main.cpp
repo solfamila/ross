@@ -1322,6 +1322,9 @@ int main(int argc, char* argv[]) {
         int bestRoiY = 0;
         int bestRoiW = 0;
         int bestRoiH = 0;
+        int histStartF = 0;
+        int histEndF = -1;
+        std::vector<std::vector<uint8_t>> roiHistory;
         std::vector<uint8_t> prevRoi;
         std::vector<uint8_t> bestRoi;
         std::vector<uint8_t> bestRoiNext;
@@ -1354,6 +1357,19 @@ int main(int argc, char* argv[]) {
         int targetRowY = -1;
         const int targetRowH = 32;
         bool targetRowLogged = false;
+
+        histStartF = videoStartFrame;
+        histEndF = (videoEndFrame >= 0) ? videoEndFrame : videoStartFrame;
+        if (histEndF < histStartF) histEndF = histStartF;
+        roiHistory.clear();
+        roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
+
+// Init ROI history bounds for refinement
+histStartF = videoStartFrame;
+histEndF = (videoEndFrame >= 0) ? videoEndFrame : (int)videoStartFrame;
+if (histEndF < histStartF) histEndF = histStartF;
+roiHistory.clear();
+roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
 
         trading_monitor::track::HeaderTemplate hdrTpl;
         if (entryTriggerMode) {
@@ -1679,8 +1695,10 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // Match target symbol in trigger ROI (with location)
-                const auto symLocTrig = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, trigRoi.triggerRoi);
+                // Match target symbol in trigger ROI (with location), restricted to symbol column
+                trading_monitor::ROI symSearchRoi = trigRoi.triggerRoi;
+                symSearchRoi.w = (std::min)(90, symSearchRoi.w);
+                const auto symLocTrig = sym.matchInGrayROIWithLoc(gray, frame.width, frame.height, symSearchRoi);
                 trigScore = symLocTrig.found ? symLocTrig.score : -1.0f;
                 profiler.markMatch(trigScore);
 
@@ -1694,17 +1712,26 @@ int main(int argc, char* argv[]) {
                         const int bandW = (std::max)(1, bandX1 - bandX0);
 
                         if (symLocTrig.found && targetRowY < 0) {
-                            int relY = symLocTrig.y - tR.y + (symLocTrig.h / 2);
-                            targetRowY = (std::max)(0, relY - targetRowH / 2);
-                            if (targetRowY + targetRowH > tR.h) {
-                                targetRowY = (std::max)(0, tR.h - targetRowH);
+                            const float rowLockThresh = 0.58f;
+                            const int relYCenter = (symLocTrig.y - tR.y) + (symLocTrig.h / 2);
+                            if (symLocTrig.score >= rowLockThresh && relYCenter >= 24 && relYCenter < tR.h) {
+                                targetRowY = (std::max)(0, relYCenter - targetRowH / 2);
+                                if (targetRowY + targetRowH > tR.h) {
+                                    targetRowY = (std::max)(0, tR.h - targetRowH);
+                                }
+                                if (!targetRowLogged) {
+                                    std::cout << "[entry-debug] symLocTrig score=" << std::fixed << std::setprecision(3)
+                                              << symLocTrig.score << " loc=" << symLocTrig.x << "," << symLocTrig.y
+                                              << " targetRowY=" << targetRowY << "\n";
+                                    targetRowLogged = true;
+                                }
                             }
-                            if (!targetRowLogged) {
-                                std::cout << "[entry-debug] symLocTrig score=" << std::fixed << std::setprecision(3) << symLocTrig.score
-                                          << " loc=" << symLocTrig.x << "," << symLocTrig.y
-                                          << " targetRowY=" << targetRowY << "\n";
-                                targetRowLogged = true;
-                            }
+                        }
+                        if (!targetRowLogged) {
+                            std::cout << "[entry-debug] symLocTrig score=" << std::fixed << std::setprecision(3) << symLocTrig.score
+                                      << " loc=" << symLocTrig.x << "," << symLocTrig.y
+                                      << " targetRowY=" << targetRowY << "\n";
+                            targetRowLogged = true;
                         }
 
                         bool useGpuDiff = (useNvdec && frame.onGpu && frame.devPtr != nullptr);
@@ -1785,6 +1812,15 @@ int main(int argc, char* argv[]) {
                                     }
                                 }
 
+                                if (useGpuDiff && frame.frameIndex >= static_cast<uint64_t>(histStartF) &&
+                                    frame.frameIndex <= static_cast<uint64_t>(histEndF)) {
+                                    const size_t idx = static_cast<size_t>(frame.frameIndex - static_cast<uint64_t>(histStartF));
+                                    if (idx < roiHistory.size()) {
+                                        roiHistory[idx].resize(roiBytes);
+                                        cudaMemcpy(roiHistory[idx].data(), d_prevRoi, roiBytes, cudaMemcpyDeviceToHost);
+                                    }
+                                }
+
                                 if (useGpuDiff) {
                                     double mean = 0.0;
                                     int bestRowIdx = 0;
@@ -1856,6 +1892,14 @@ int main(int argc, char* argv[]) {
                                 std::memcpy(dst, src, static_cast<size_t>(tR.w));
                             }
 
+                            if (frame.frameIndex >= static_cast<uint64_t>(histStartF) &&
+                                frame.frameIndex <= static_cast<uint64_t>(histEndF)) {
+                                const size_t idx = static_cast<size_t>(frame.frameIndex - static_cast<uint64_t>(histStartF));
+                                if (idx < roiHistory.size()) {
+                                    roiHistory[idx] = roiNow;
+                                }
+                            }
+
                             if (captureNextRoi && frame.frameIndex == bestChangeFrame + 1) {
                                 bestRoiNext = roiNow;
                                 bestRoiNextW = tR.w;
@@ -1867,7 +1911,15 @@ int main(int argc, char* argv[]) {
                                 captureNextRoi = false;
                             }
 
-                            if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
+                            
+// Store ROI for refinement
+if ((int)frame.frameIndex >= histStartF && (int)frame.frameIndex <= histEndF) {
+    const size_t idx = static_cast<size_t>((int)frame.frameIndex - histStartF);
+    if (idx < roiHistory.size()) {
+        roiHistory[idx] = roiNow;
+    }
+}
+if (!prevRoi.empty() && (int)prevRoi.size() == (int)roiNow.size()) {
                                 double mean = 0.0;
                                 int bestRowIdx = 0;
 
@@ -2187,39 +2239,30 @@ int main(int argc, char* argv[]) {
                     uint64_t presentFirstFrame = bestChangeFrame;
                     const float ocrPresentThresh = 0.60f;
                     if (bestChangeFrame > 0 && bestRoiW > 0 && bestRoiH > 0) {
-                        const int scanStart = (bestChangeFrame > 3) ? (int)(bestChangeFrame - 3) : 0;
-                        const int scanEnd = (int)(bestChangeFrame + 6);
-                        trading_monitor::video::MFSourceReaderDecoder decScan;
-                        std::string errScan;
-                        if (decScan.open(fs::path(resolved).wstring(), errScan)) {
-                            trading_monitor::video::VideoFrameY frScan;
-                            while (decScan.readFrame(frScan, errScan)) {
-                                const int idx = (int)frScan.frameIndex;
-                                if (idx < scanStart) continue;
-                                if (idx > scanEnd) break;
-                                std::vector<uint8_t> grayScan(static_cast<size_t>(frScan.width) * static_cast<size_t>(frScan.height));
-                                for (int y = 0; y < frScan.height; ++y) {
-                                    const uint8_t* srcRow = frScan.y.data() + static_cast<size_t>(y) * static_cast<size_t>(frScan.strideY);
-                                    uint8_t* dstRow = grayScan.data() + static_cast<size_t>(y) * static_cast<size_t>(frScan.width);
-                                    std::memcpy(dstRow, srcRow, static_cast<size_t>(frScan.width));
-                                }
-                                trading_monitor::ROI scanRoi{"scan", bestRoiX, bestRoiY, bestRoiW, bestRoiH};
-                                scanRoi = clampROIToFrame(scanRoi, frScan.width, frScan.height);
-                                std::vector<uint8_t> roiScan(static_cast<size_t>(scanRoi.w) * static_cast<size_t>(scanRoi.h));
-                                for (int yy = 0; yy < scanRoi.h; ++yy) {
-                                    const uint8_t* src = grayScan.data() + static_cast<size_t>(scanRoi.y + yy) * static_cast<size_t>(frScan.width) + static_cast<size_t>(scanRoi.x);
-                                    uint8_t* dst = roiScan.data() + static_cast<size_t>(yy) * static_cast<size_t>(scanRoi.w);
-                                    std::memcpy(dst, src, static_cast<size_t>(scanRoi.w));
-                                }
-                                trading_monitor::detect::GlyphOCRResult scanOcr;
-                                std::vector<uint8_t> scanRowPatch;
-                                int scanRowW = 0;
-                                int scanRowH = 0;
-                                runOcrOnRoi(roiScan, scanRoi.w, scanRoi.h, scanOcr, scanRowPatch, scanRowW, scanRowH);
-                                if (!scanOcr.text.empty() && tgt.rfind(scanOcr.text, 0) == 0 && scanOcr.score >= ocrPresentThresh) {
-                                    presentFirstFrame = frScan.frameIndex;
-                                    break;
-                                }
+                        const int scanStart = (std::max)(histStartF, (int)bestChangeFrame + 1);
+                        const int scanEnd = (std::min)(histEndF, (int)bestChangeFrame + 10);
+                        for (int idx = scanStart; idx <= scanEnd; ++idx) {
+                            const size_t hidx = static_cast<size_t>(idx - histStartF);
+                            if (hidx >= roiHistory.size()) continue;
+                            const auto& roiScan = roiHistory[hidx];
+                            if (roiScan.empty()) continue;
+                            trading_monitor::detect::GlyphOCRResult scanOcr;
+                            std::vector<uint8_t> scanRowPatch;
+                            int scanRowW = 0;
+                            int scanRowH = 0;
+                            runOcrOnRoi(roiScan, bestRoiW, bestRoiH, scanOcr, scanRowPatch, scanRowW, scanRowH);
+                            float scanWordScore = -1.0f;
+#if defined(TM_USE_OPENCV)
+                            if (!scanRowPatch.empty() && scanRowW > 0 && scanRowH > 0) {
+                                cv::Mat rowMat(scanRowH, scanRowW, CV_8UC1, (void*)scanRowPatch.data());
+                                scanWordScore = matchWordScore(rowMat, tgt);
+                            }
+#endif
+                            const bool ocrOk = (!scanOcr.text.empty() && tgt.rfind(scanOcr.text, 0) == 0 && scanOcr.score >= ocrPresentThresh);
+                            const bool wordOk = (scanWordScore >= 0.50f);
+                            if (ocrOk || wordOk) {
+                                presentFirstFrame = static_cast<uint64_t>(idx);
+                                break;
                             }
                         }
                     }
