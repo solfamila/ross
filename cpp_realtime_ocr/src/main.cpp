@@ -49,6 +49,7 @@
 #include "detection/panel_finder.h"
 #include "detection/symbol_matcher.h"
 #include "detection/entry_trigger.h"
+#include "detection/entry_all_detector.h"
 #include "detection/glyph_ocr.h"
 #include "detection/trigger_roi_builder.h"
 #include "detection/yolo_detector.h"
@@ -330,6 +331,10 @@ void printUsage(const char* programName) {
               << "  --json-output <file>  Write OCR results to JSON file (structured output)\n"
               << "  --benchmark        Run benchmark mode\n"
               << "  --verbose          Enable verbose logging\n"
+              << "  --entry-all-x <px>  Override entry-all symbol column X offset\n"
+              << "  --entry-all-w <px>  Override entry-all symbol column width\n"
+              << "  --entry-all-body-y <px>  Override entry-all row-body Y offset (from panel top)\n"
+              << "  --entry-all-body-h <px>  Override entry-all row-body height\n"
               << "  --help             Show this help message\n"
               << "\n"
               << "YOLOv10 Window Detection:\n"
@@ -903,6 +908,10 @@ int main(int argc, char* argv[]) {
     bool windowSpecified = false;
     bool benchmarkMode = false;
     bool verbose = false;
+    int entryAllSymbolXOverride = -1;
+    int entryAllSymbolWOverride = -1;
+    int entryAllBodyYOffsetOverride = -1;
+    int entryAllBodyHeightOverride = -1;
     bool enableChangeDetect = true;
     int changeThreshold = 5;
 
@@ -941,7 +950,7 @@ int main(int argc, char* argv[]) {
     bool videoNvdec = false;
 
     // Entry-trigger mode (timing-first)
-    std::string modeStr = "panel-detect"; // panel-detect | entry-trigger
+    std::string modeStr = "panel-detect"; // panel-detect | entry-trigger | entry-all
     std::string targetSymbol;
     double delayCompMs = 0.0;
     bool enableProfile = false;
@@ -1204,6 +1213,14 @@ int main(int argc, char* argv[]) {
             benchmarkMode = true;
         } else if (arg == "--verbose") {
             verbose = true;
+        } else if (arg == "--entry-all-x" && i + 1 < argc) {
+            entryAllSymbolXOverride = std::stoi(argv[++i]);
+        } else if (arg == "--entry-all-w" && i + 1 < argc) {
+            entryAllSymbolWOverride = std::stoi(argv[++i]);
+        } else if (arg == "--entry-all-body-y" && i + 1 < argc) {
+            entryAllBodyYOffsetOverride = std::stoi(argv[++i]);
+        } else if (arg == "--entry-all-body-h" && i + 1 < argc) {
+            entryAllBodyHeightOverride = std::stoi(argv[++i]);
         }
     }
     
@@ -1223,6 +1240,8 @@ int main(int argc, char* argv[]) {
         std::string resolved = resolvePathWithFallbacks(videoPath);
 
         const bool entryTriggerMode = (modeStr == "entry-trigger");
+        const bool entryAllMode = (modeStr == "entry-all");
+        const bool entryAnyMode = (entryTriggerMode || entryAllMode);
         if (entryTriggerMode && targetSymbol.empty()) {
             std::cerr << "ERROR: --mode entry-trigger requires --target <SYMBOL>\n";
             return 1;
@@ -1233,7 +1252,7 @@ int main(int argc, char* argv[]) {
         panelCfg.hdrThreshold = panelThreshold;
         panelCfg.maxSearchW = 640.0f;
 
-        if (detectPanels || entryTriggerMode) {
+        if (detectPanels || entryAnyMode) {
             const std::string resolvedDir = resolvePathWithFallbacks(panelTemplateDir);
             const std::string positionsHdr = (fs::path(resolvedDir) / "positions_hdr.png").string();
             const std::string orderHdr = (fs::path(resolvedDir) / "order_hdr.png").string();
@@ -1308,6 +1327,10 @@ int main(int argc, char* argv[]) {
         // Entry-trigger pipeline state (optional)
         trading_monitor::detect::SymbolMatcher sym;
         trading_monitor::detect::EntryTrigger entry({});
+        trading_monitor::detect::EntryAllConfig entryAllCfg;
+        entryAllCfg.debug = verbose;
+        entryAllCfg.debugMax = 6;
+        trading_monitor::detect::EntryAllDetector entryAll(entryAllCfg);
         trading_monitor::detect::TriggerRoiBuilder trigBuilder;
         trading_monitor::detect::TriggerRoiConfig trigCfg;
         trading_monitor::detect::TriggerRoiResult trigRoi;
@@ -1358,31 +1381,76 @@ int main(int argc, char* argv[]) {
         const int targetRowH = 32;
         bool targetRowLogged = false;
 
+        // Entry-all SVTR OCR (optional, for higher fidelity symbol reads)
+        trading_monitor::SVTRInference entryAllSvtr;
+        trading_monitor::CTCDecoder entryAllDecoder;
+        bool entryAllSvtrReady = false;
+        int entryAllTimesteps = 0;
+        int entryAllNumClasses = 0;
+        std::vector<float> entryAllHostInput;
+        std::vector<float> entryAllHostOutput;
+        float* entryAllDeviceInput = nullptr;
+        cudaStream_t entryAllStream = nullptr;
+
+        const int entryAllMaxRows = 3;
+        std::vector<std::vector<uint8_t>> entryAllPrevBands;
+        std::vector<int> entryAllPrevW;
+        std::vector<int> entryAllPrevH;
+        std::vector<bool> entryAllSeen;
+        int entryAllSymbolX = -1;
+        trading_monitor::RowDetector entryAllRowDet;
+        bool entryAllRowDetInit = false;
+        int entryAllRowW = 0;
+        int entryAllRowH = 0;
+
+        if (entryAllMode) {
+            entryAllPrevBands.resize(entryAllMaxRows);
+            entryAllPrevW.assign(entryAllMaxRows, 0);
+            entryAllPrevH.assign(entryAllMaxRows, 0);
+            entryAllSeen.assign(entryAllMaxRows, false);
+
+            if (entryAllSvtr.loadModel(enginePath)) {
+                entryAllSvtr.getOutputDims(entryAllTimesteps, entryAllNumClasses);
+                if (entryAllDecoder.loadDictionary(dictPath)) {
+                    entryAllDecoder.ensurePaddleOCRDictionarySize(entryAllNumClasses);
+                }
+
+                const size_t inputElems = static_cast<size_t>(3) * 48 * 320;
+                entryAllHostInput.assign(inputElems, -1.0f);
+                entryAllHostOutput.resize(static_cast<size_t>(entryAllTimesteps) * static_cast<size_t>(entryAllNumClasses));
+
+                cudaStreamCreateWithFlags(&entryAllStream, cudaStreamNonBlocking);
+                cudaMalloc(&entryAllDeviceInput, inputElems * sizeof(float));
+
+                entryAllSvtrReady = (entryAllDeviceInput != nullptr);
+                if (!entryAllSvtrReady) {
+                    std::cerr << "WARNING: Failed to allocate SVTR input buffer for entry-all; falling back to glyph OCR.\n";
+                }
+            } else if (verbose) {
+                std::cerr << "WARNING: SVTR engine not available for entry-all; falling back to glyph OCR.\n";
+            }
+        }
+
         histStartF = videoStartFrame;
         histEndF = (videoEndFrame >= 0) ? videoEndFrame : videoStartFrame;
         if (histEndF < histStartF) histEndF = histStartF;
         roiHistory.clear();
         roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
 
-// Init ROI history bounds for refinement
-histStartF = videoStartFrame;
-histEndF = (videoEndFrame >= 0) ? videoEndFrame : (int)videoStartFrame;
-if (histEndF < histStartF) histEndF = histStartF;
-roiHistory.clear();
-roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
-
         trading_monitor::track::HeaderTemplate hdrTpl;
-        if (entryTriggerMode) {
-            // Load symbol templates (expected: templates/symbols/<SYMBOL>_*.png)
-            const std::string symDir = resolvePathWithFallbacks("templates/symbols");
-            if (!sym.loadSymbolTemplates(symDir, targetSymbol, err)) {
-                std::cerr << "ERROR: Symbol template load failed: " << err << "\n";
-                return 1;
+        if (entryAnyMode) {
+            if (entryTriggerMode) {
+                // Load symbol templates (expected: templates/symbols/<SYMBOL>_*.png)
+                const std::string symDir = resolvePathWithFallbacks("templates/symbols");
+                if (!sym.loadSymbolTemplates(symDir, targetSymbol, err)) {
+                    std::cerr << "ERROR: Symbol template load failed: " << err << "\n";
+                    return 1;
+                }
+                trading_monitor::detect::EntryTriggerConfig ecfg;
+                ecfg.delayCompensationMs = delayCompMs;
+                entry = trading_monitor::detect::EntryTrigger(ecfg);
+                entry.setTargetSymbol(targetSymbol);
             }
-            trading_monitor::detect::EntryTriggerConfig ecfg;
-            ecfg.delayCompensationMs = delayCompMs;
-            entry = trading_monitor::detect::EntryTrigger(ecfg);
-            entry.setTargetSymbol(targetSymbol);
 
             // Load the positions header template into a HeaderTemplate for tracking.
             const std::string resolvedDir = resolvePathWithFallbacks(panelTemplateDir);
@@ -1468,7 +1536,7 @@ roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
                 frameTimeMs = 1000.0 * (static_cast<double>(frame.frameIndex) / videoFps);
             }
 
-            if (entryTriggerMode) {
+            if (entryAnyMode) {
                 profiler.beginFrame(frame.frameIndex);
 
                 if ((int)frame.frameIndex < videoStartFrame) {
@@ -1701,6 +1769,445 @@ roiHistory.resize(static_cast<size_t>(histEndF - histStartF + 1));
                 }
                 if (!trigRoi.ok) {
                     printProgress();
+                    profiler.endFrame();
+                    continue;
+                }
+
+                if (entryAllMode) {
+                    trading_monitor::ROI tR = found.positionsPanel;
+                    if (tR.w <= 0 || tR.h <= 0) {
+                        tR = trigRoi.triggerRoi;
+                    } else {
+                        // Ensure symbol column on the left is included.
+                        const int panelRight = tR.x + tR.w;
+                        int desiredLeft = found.positionsHeader.x - 40;
+                        desiredLeft = (std::max)(0, desiredLeft);
+                        if (desiredLeft < tR.x && panelRight > desiredLeft) {
+                            tR.x = desiredLeft;
+                            tR.w = (std::max)(1, panelRight - tR.x);
+                        }
+
+                        const int headerBottom = found.positionsHeader.y + found.positionsHeader.h + 2;
+                        const int panelBottom = tR.y + tR.h;
+                        if (headerBottom > tR.y && headerBottom < panelBottom) {
+                            const int newY = headerBottom;
+                            const int newH = panelBottom - newY;
+                            if (newH > 0) {
+                                tR.y = newY;
+                                tR.h = newH;
+                            }
+                        }
+                    }
+
+                    if (entryAllSvtrReady) {
+#if defined(TM_USE_OPENCV)
+                        const int bandH = 32;
+                        int baseSymbolW = (std::min)(90, tR.w);
+                        const std::vector<int> xOffsets = {0, 12, 24, 36};
+                        const int stride = (std::max)(1, tR.h / entryAllMaxRows);
+                        const float ocrMinConf = 0.40f;
+
+                        int bodyOffsetY = 0;
+                        int bodyH = tR.h;
+
+                        auto percentile = [](std::vector<float> v, float pct) -> float {
+                            if (v.empty()) return 0.0f;
+                            pct = (std::max)(0.0f, (std::min)(100.0f, pct));
+                            const size_t k = static_cast<size_t>(std::lround((pct / 100.0f) * (v.size() - 1)));
+                            std::nth_element(v.begin(), v.begin() + k, v.end());
+                            return v[k];
+                        };
+
+                        if (entryAllBodyYOffsetOverride >= 0 || entryAllBodyHeightOverride > 0) {
+                            if (entryAllBodyYOffsetOverride >= 0) {
+                                bodyOffsetY = entryAllBodyYOffsetOverride;
+                            }
+                            if (entryAllBodyHeightOverride > 0) {
+                                bodyH = entryAllBodyHeightOverride;
+                            } else {
+                                bodyH = tR.h - bodyOffsetY;
+                            }
+                        } else if (tR.h > 24 && tR.w > 24) {
+                            const int rowBandW = (std::min)(160, tR.w);
+                            std::vector<float> rowEnergy(static_cast<size_t>(tR.h), 0.0f);
+                            for (int yy = 1; yy < tR.h - 1; ++yy) {
+                                const uint8_t* up = gray.data() + static_cast<size_t>(tR.y + yy - 1) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
+                                const uint8_t* dn = gray.data() + static_cast<size_t>(tR.y + yy + 1) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
+                                float acc = 0.0f;
+                                for (int xx = 1; xx < rowBandW - 1; ++xx) {
+                                    acc += static_cast<float>(std::abs((int)dn[xx] - (int)up[xx]));
+                                }
+                                rowEnergy[static_cast<size_t>(yy)] = acc;
+                            }
+
+                            const int win = 15;
+                            std::vector<float> smooth(rowEnergy.size(), 0.0f);
+                            for (int yy = 0; yy < tR.h; ++yy) {
+                                int a = (std::max)(0, yy - win / 2);
+                                int b = (std::min)(tR.h - 1, yy + win / 2);
+                                float sum = 0.0f;
+                                for (int k = a; k <= b; ++k) sum += rowEnergy[static_cast<size_t>(k)];
+                                smooth[static_cast<size_t>(yy)] = sum / static_cast<float>(b - a + 1);
+                            }
+
+                            const float thr = percentile(smooth, 70.0f);
+                            int bestA = -1;
+                            int bestB = -1;
+                            float bestScore = -1.0f;
+                            int curA = -1;
+                            for (int yy = 0; yy < tR.h; ++yy) {
+                                const bool on = (smooth[static_cast<size_t>(yy)] > thr);
+                                if (on && curA < 0) curA = yy;
+                                if ((!on || yy == tR.h - 1) && curA >= 0) {
+                                    int curB = on ? yy : (yy - 1);
+                                    float score = 0.0f;
+                                    for (int k = curA; k <= curB; ++k) score += smooth[static_cast<size_t>(k)];
+                                    const float center = 0.5f * (curA + curB);
+                                    const bool inLowerHalf = center >= (tR.h * 0.45f);
+                                    if (inLowerHalf) {
+                                        if (score > bestScore || (std::abs(score - bestScore) < 1e-3f && curB > bestB)) {
+                                            bestScore = score;
+                                            bestA = curA;
+                                            bestB = curB;
+                                        }
+                                    }
+                                    curA = -1;
+                                }
+                            }
+
+                            if (bestA >= 0 && bestB >= bestA) {
+                                bodyOffsetY = bestA;
+                                bodyH = bestB - bestA + 1;
+                            } else {
+                                bodyOffsetY = (int)std::lround(tR.h * 0.55f);
+                                bodyH = (int)std::lround(tR.h * 0.40f);
+                            }
+
+                            const int minBodyH = (std::max)(60, (int)std::lround(tR.h * 0.35f));
+                            if (bodyH < minBodyH) {
+                                const int center = bodyOffsetY + (bodyH / 2);
+                                bodyH = minBodyH;
+                                bodyOffsetY = center - (bodyH / 2);
+                            }
+                            const int minLower = (std::max)(150, (int)std::lround(tR.h * 0.45f));
+                            if (bodyOffsetY < minLower) {
+                                bodyOffsetY = minLower;
+                            }
+                        } else if (tR.h > 1) {
+                            bodyOffsetY = (int)std::lround(tR.h * 0.55f);
+                            bodyH = (int)std::lround(tR.h * 0.40f);
+                        }
+                        bodyOffsetY = (std::max)(0, (std::min)(bodyOffsetY, tR.h - 1));
+                        bodyH = (std::max)(1, (std::min)(bodyH, tR.h - bodyOffsetY));
+
+                        trading_monitor::ROI tRBody = tR;
+                        tRBody.y += bodyOffsetY;
+                        tRBody.h = bodyH;
+                        if (verbose) {
+                            std::cout << "[entry-all] bodyOffsetY=" << bodyOffsetY
+                                      << " bodyH=" << bodyH
+                                      << " panelH=" << tR.h
+                                      << "\n";
+                        }
+
+                        cv::Mat grayMat(frame.height, frame.width, CV_8UC1, (void*)gray.data());
+
+                        std::vector<trading_monitor::DetectedRow> detRows;
+                        static bool dumpedEntryAll = false;
+                        if (tRBody.w > 0 && tRBody.h > 0) {
+                            const int rowDetectW = (std::min)(160, tRBody.w);
+                            if (!entryAllRowDetInit || entryAllRowW != rowDetectW || entryAllRowH != tRBody.h) {
+                                entryAllRowDet.initialize(rowDetectW, tRBody.h);
+                                entryAllRowDetInit = true;
+                                entryAllRowW = rowDetectW;
+                                entryAllRowH = tRBody.h;
+                            }
+                            std::vector<uint8_t> bgra(static_cast<size_t>(rowDetectW) * static_cast<size_t>(tRBody.h) * 4);
+                            for (int yy = 0; yy < tRBody.h; ++yy) {
+                                const uint8_t* src = gray.data() + static_cast<size_t>(tRBody.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tRBody.x);
+                                uint8_t* dst = bgra.data() + static_cast<size_t>(yy) * static_cast<size_t>(rowDetectW) * 4;
+                                for (int xx = 0; xx < rowDetectW; ++xx) {
+                                    const uint8_t g = src[xx];
+                                    dst[xx * 4 + 0] = g;
+                                    dst[xx * 4 + 1] = g;
+                                    dst[xx * 4 + 2] = g;
+                                    dst[xx * 4 + 3] = 255;
+                                }
+                            }
+                            detRows = entryAllRowDet.detectRows(bgra.data(), rowDetectW, tRBody.h, rowDetectW * 4);
+                            std::sort(detRows.begin(), detRows.end(), [](const trading_monitor::DetectedRow& a, const trading_monitor::DetectedRow& b) {
+                                return a.yStart < b.yStart;
+                            });
+                            if (detRows.size() > static_cast<size_t>(entryAllMaxRows)) {
+                                detRows.resize(static_cast<size_t>(entryAllMaxRows));
+                            }
+                        }
+
+                        auto runSvtrAt = [&](int rx, int fy0, int w, int h, std::string& outTicker, float& outConf) {
+                            const int dstH = 48;
+                            const int dstW = 320;
+                            outTicker.clear();
+                            outConf = -1.0f;
+
+                            cv::Mat roi = grayMat(cv::Rect(rx, fy0, w, h));
+                            cv::Mat roiNorm;
+                            cv::normalize(roi, roiNorm, 0, 255, cv::NORM_MINMAX);
+                            const float scale = static_cast<float>(dstH) / static_cast<float>(roi.rows);
+                            int resizedW = (int)std::lround(static_cast<float>(roi.cols) * scale);
+                            resizedW = (std::max)(1, (std::min)(dstW, resizedW));
+
+                            cv::Mat resized;
+                            cv::resize(roiNorm, resized, cv::Size(resizedW, dstH), 0.0, 0.0, cv::INTER_LINEAR);
+
+                            for (bool invert : {false, true}) {
+                                std::fill(entryAllHostInput.begin(), entryAllHostInput.end(), -1.0f);
+                                for (int yy = 0; yy < dstH; ++yy) {
+                                    const uint8_t* srcRow = resized.ptr<uint8_t>(yy);
+                                    for (int xx = 0; xx < resizedW; ++xx) {
+                                        const uint8_t px = invert ? static_cast<uint8_t>(255 - srcRow[xx]) : srcRow[xx];
+                                        const float v01 = px / 255.0f;
+                                        const float v = (v01 - 0.5f) / 0.5f;
+                                        for (int c = 0; c < 3; ++c) {
+                                            entryAllHostInput[(static_cast<size_t>(c) * dstH + yy) * dstW + xx] = v;
+                                        }
+                                    }
+                                }
+
+                                const size_t inputBytes = entryAllHostInput.size() * sizeof(float);
+                                cudaMemcpyAsync(entryAllDeviceInput, entryAllHostInput.data(), inputBytes, cudaMemcpyHostToDevice, entryAllStream);
+                                if (!entryAllSvtr.infer(entryAllDeviceInput, dstW, dstH, entryAllStream)) {
+                                    continue;
+                                }
+
+                                float* d_probs = entryAllSvtr.getOutputProbs();
+                                const size_t outBytes = entryAllHostOutput.size() * sizeof(float);
+                                cudaMemcpyAsync(entryAllHostOutput.data(), d_probs, outBytes, cudaMemcpyDeviceToHost, entryAllStream);
+                                cudaStreamSynchronize(entryAllStream);
+
+                                CTCResult res = entryAllDecoder.decode(entryAllHostOutput.data(), entryAllTimesteps, entryAllNumClasses, 0);
+                                const std::string ticker = extractTickerLike(res.text);
+                                if (!ticker.empty() && ticker.size() <= 4 && res.confidence > outConf) {
+                                    outConf = res.confidence;
+                                    outTicker = ticker;
+                                }
+                            }
+                        };
+
+                        if (entryAllSymbolWOverride > 0) {
+                            baseSymbolW = (std::min)(entryAllSymbolWOverride, tR.w);
+                        }
+                        if (entryAllSymbolXOverride >= 0) {
+                            entryAllSymbolX = entryAllSymbolXOverride;
+                        }
+
+                        if (entryAllSymbolX < 0) {
+                            const int searchMax = (std::max)(0, (std::min)(120, tR.w - baseSymbolW));
+                            float bestConf = -1.0f;
+                            int bestX = -1;
+
+                            // Use row 0 to find the most plausible symbol column
+                            int y0 = 0;
+                            int h = 0;
+                            if (!detRows.empty()) {
+                                y0 = detRows[0].yStart + bodyOffsetY;
+                                h = detRows[0].height;
+                            } else {
+                                const int rowTop = 0;
+                                const int rowCenter = rowTop + (stride / 2);
+                                y0 = rowCenter - (bandH / 2) + bodyOffsetY;
+                                y0 = (std::max)(0, (std::min)(y0, tR.h - 1));
+                                int y1 = (std::min)(tR.h, y0 + bandH);
+                                h = y1 - y0;
+                            }
+                            if (h >= 8) {
+                                const int fy0 = tR.y + y0;
+                                for (int xOff = 0; xOff <= searchMax; xOff += 4) {
+                                    const int rx = tR.x + xOff;
+                                    if (rx + baseSymbolW > frame.width) continue;
+                                    if (fy0 + h > frame.height) continue;
+
+                                    std::string ticker;
+                                    float conf = -1.0f;
+                                    runSvtrAt(rx, fy0, baseSymbolW, h, ticker, conf);
+                                    if (!ticker.empty() && conf > bestConf) {
+                                        bestConf = conf;
+                                        bestX = xOff;
+                                    }
+                                }
+                            }
+                            if (bestX >= 0) {
+                                entryAllSymbolX = bestX;
+                                if (verbose) {
+                                    std::cout << "[entry-all] symbolX=" << entryAllSymbolX
+                                              << " conf=" << std::fixed << std::setprecision(2) << bestConf
+                                              << "\n";
+                                }
+                            }
+                        }
+
+                        if (!dumpedEntryAll) {
+                            // Dump panel and row crops for inspection
+                            if (tR.w > 0 && tR.h > 0) {
+                                std::vector<uint8_t> panel(static_cast<size_t>(tR.w) * static_cast<size_t>(tR.h));
+                                for (int yy = 0; yy < tR.h; ++yy) {
+                                    const uint8_t* src = gray.data() + static_cast<size_t>(tR.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tR.x);
+                                    uint8_t* dst = panel.data() + static_cast<size_t>(yy) * static_cast<size_t>(tR.w);
+                                    std::memcpy(dst, src, static_cast<size_t>(tR.w));
+                                }
+                                writePNGGray8(L"debug_entry_all_panel.png", panel.data(), tR.w, tR.h);
+                            }
+
+                            if (tRBody.w > 0 && tRBody.h > 0) {
+                                std::vector<uint8_t> body(static_cast<size_t>(tRBody.w) * static_cast<size_t>(tRBody.h));
+                                for (int yy = 0; yy < tRBody.h; ++yy) {
+                                    const uint8_t* src = gray.data() + static_cast<size_t>(tRBody.y + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(tRBody.x);
+                                    uint8_t* dst = body.data() + static_cast<size_t>(yy) * static_cast<size_t>(tRBody.w);
+                                    std::memcpy(dst, src, static_cast<size_t>(tRBody.w));
+                                }
+                                writePNGGray8(L"debug_entry_all_body.png", body.data(), tRBody.w, tRBody.h);
+                            }
+
+                            const int useX = (entryAllSymbolX >= 0) ? entryAllSymbolX : 0;
+                            for (int r = 0; r < entryAllMaxRows; ++r) {
+                                int y0 = 0;
+                                int h = 0;
+                                if (r < static_cast<int>(detRows.size())) {
+                                    y0 = detRows[static_cast<size_t>(r)].yStart + bodyOffsetY;
+                                    h = detRows[static_cast<size_t>(r)].height;
+                                } else {
+                                    const int rowTop = r * stride;
+                                    const int rowCenter = rowTop + (stride / 2);
+                                    y0 = rowCenter - (bandH / 2) + bodyOffsetY;
+                                    y0 = (std::max)(0, (std::min)(y0, tR.h - 1));
+                                    int y1 = (std::min)(tR.h, y0 + bandH);
+                                    h = y1 - y0;
+                                }
+
+                                if (h < 8) continue;
+                                const int rx = tR.x + useX;
+                                const int ry = tR.y + y0;
+                                const int rw = (std::min)(baseSymbolW, tR.w - useX);
+                                if (rx < 0 || ry < 0 || rx + rw > frame.width || ry + h > frame.height) continue;
+
+                                std::vector<uint8_t> rowPatch(static_cast<size_t>(rw) * static_cast<size_t>(h));
+                                for (int yy = 0; yy < h; ++yy) {
+                                    const uint8_t* src = gray.data() + static_cast<size_t>(ry + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(rx);
+                                    uint8_t* dst = rowPatch.data() + static_cast<size_t>(yy) * static_cast<size_t>(rw);
+                                    std::memcpy(dst, src, static_cast<size_t>(rw));
+                                }
+
+                                std::wstring outPath = L"debug_entry_all_row_" + std::to_wstring(r) + L".png";
+                                writePNGGray8(outPath, rowPatch.data(), rw, h);
+                            }
+
+                            dumpedEntryAll = true;
+                        }
+
+                        for (int r = 0; r < entryAllMaxRows; ++r) {
+                            if (entryAllSeen[r]) continue;
+
+                            int y0 = 0;
+                            int h = 0;
+                            if (r < static_cast<int>(detRows.size())) {
+                                y0 = detRows[static_cast<size_t>(r)].yStart + bodyOffsetY;
+                                h = detRows[static_cast<size_t>(r)].height;
+                            } else {
+                                const int rowTop = r * stride;
+                                const int rowCenter = rowTop + (stride / 2);
+                                y0 = rowCenter - (bandH / 2) + bodyOffsetY;
+                                y0 = (std::max)(0, (std::min)(y0, tR.h - 1));
+                                int y1 = (std::min)(tR.h, y0 + bandH);
+                                h = y1 - y0;
+                            }
+                            if (h < 8) continue;
+
+                            const int fx0 = tR.x;
+                            const int fy0 = tR.y + y0;
+                            if (fx0 < 0 || fy0 < 0) continue;
+                            if (fx0 + baseSymbolW > frame.width) continue;
+                            if (fy0 + h > frame.height) continue;
+
+                            std::vector<uint8_t> band(static_cast<size_t>(baseSymbolW) * static_cast<size_t>(h));
+                            for (int yy = 0; yy < h; ++yy) {
+                                const uint8_t* src = gray.data() + static_cast<size_t>(fy0 + yy) * static_cast<size_t>(frame.width) + static_cast<size_t>(fx0);
+                                uint8_t* dst = band.data() + static_cast<size_t>(yy) * static_cast<size_t>(baseSymbolW);
+                                std::memcpy(dst, src, static_cast<size_t>(baseSymbolW));
+                            }
+
+                            bool changed = true;
+                            if (!entryAllPrevBands[r].empty() && entryAllPrevW[r] == baseSymbolW && entryAllPrevH[r] == h) {
+                                double sum = 0.0;
+                                const size_t n = band.size();
+                                for (size_t i = 0; i < n; ++i) sum += std::abs((int)band[i] - (int)entryAllPrevBands[r][i]);
+                                const double mean = sum / (double)n;
+                                changed = (mean >= entryAllCfg.diffThreshold);
+                            }
+                            entryAllPrevBands[r] = band;
+                            entryAllPrevW[r] = baseSymbolW;
+                            entryAllPrevH[r] = h;
+
+                            if (!changed) continue;
+
+                            const int dstH = 48;
+                            const int dstW = 320;
+                            float bestConf = -1.0f;
+                            std::string bestTicker;
+
+                            std::vector<int> scanOffsets = xOffsets;
+                            if (entryAllSymbolX >= 0) {
+                                scanOffsets = {entryAllSymbolX - 8, entryAllSymbolX, entryAllSymbolX + 8};
+                            }
+
+                            for (int xOff : scanOffsets) {
+                                if (xOff < 0 || xOff >= tR.w) continue;
+                                if (xOff + baseSymbolW > tR.w) continue;
+                                const int rx = tR.x + xOff;
+                                if (rx + baseSymbolW > frame.width) continue;
+                                std::string ticker;
+                                float conf = -1.0f;
+                                runSvtrAt(rx, fy0, baseSymbolW, h, ticker, conf);
+                                if (!ticker.empty() && conf > bestConf) {
+                                    bestConf = conf;
+                                    bestTicker = ticker;
+                                }
+                            }
+
+                            if (!bestTicker.empty() && bestConf >= ocrMinConf) {
+                                entryAllSeen[r] = true;
+                                std::cout << "[entry-all] ENTRY symbol=" << bestTicker
+                                          << " frame=" << frame.frameIndex
+                                          << " t_ms=" << std::fixed << std::setprecision(2) << frameTimeMs
+                                          << " row=" << r
+                                          << " ocr=" << std::fixed << std::setprecision(2) << bestConf
+                                          << "\n";
+                            }
+                        }
+#else
+                        std::cerr << "WARNING: entry-all SVTR OCR requires OpenCV; falling back to glyph OCR.\n";
+                        entryAllSvtrReady = false;
+#endif
+                    }
+
+                    if (!entryAllSvtrReady) {
+                        auto events = entryAll.update(
+                            frame.frameIndex,
+                            frameTimeMs,
+                            gray,
+                            frame.width,
+                            frame.height,
+                            tR.x,
+                            tR.y,
+                            tR.w,
+                            tR.h);
+                        for (const auto& ev : events) {
+                            std::cout << "[entry-all] ENTRY symbol=" << ev.symbol
+                                      << " frame=" << ev.frame
+                                      << " t_ms=" << std::fixed << std::setprecision(2) << ev.t_ms
+                                      << " row=" << ev.row
+                                      << " ocr=" << std::fixed << std::setprecision(2) << ev.ocr_score
+                                      << "\n";
+                        }
+                    }
                     profiler.endFrame();
                     continue;
                 }

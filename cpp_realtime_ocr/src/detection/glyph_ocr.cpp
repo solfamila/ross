@@ -25,21 +25,28 @@ GlyphOCRResult ocrTickerFromRowGray(const std::vector<uint8_t>& rowGray, int w, 
     cv::Mat up;
     cv::resize(rowCrop, up, cv::Size(), 2.0, 2.0, cv::INTER_CUBIC);
 
-    cv::Mat bw;
-    cv::threshold(up, bw, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
-
-    std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(bw, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
     struct Box { int x, y, w, h; };
+    auto findBoxes = [](const cv::Mat& bw, std::vector<Box>& boxesOut) {
+        boxesOut.clear();
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(bw, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        for (const auto& c : contours) {
+            cv::Rect r = cv::boundingRect(c);
+            int area = r.width * r.height;
+            if (area < 40) continue;
+            if (r.height < 12 || r.height > 80) continue;
+            if (r.width < 5 || r.width > 60) continue;
+            boxesOut.push_back({r.x, r.y, r.width, r.height});
+        }
+    };
+
+    cv::Mat bw;
     std::vector<Box> boxes;
-    for (const auto& c : contours) {
-        cv::Rect r = cv::boundingRect(c);
-        int area = r.width * r.height;
-        if (area < 40) continue;
-        if (r.height < 12 || r.height > 80) continue;
-        if (r.width < 5 || r.width > 60) continue;
-        boxes.push_back({r.x, r.y, r.width, r.height});
+    cv::threshold(up, bw, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    findBoxes(bw, boxes);
+    if (boxes.empty()) {
+        cv::threshold(up, bw, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        findBoxes(bw, boxes);
     }
     std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) { return a.x < b.x; });
     if (boxes.empty()) return out;

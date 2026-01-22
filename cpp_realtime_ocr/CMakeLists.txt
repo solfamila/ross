@@ -155,6 +155,7 @@ set(CPP_SOURCES
     src/detection/panel_finder.cpp
     src/detection/symbol_matcher.cpp
     src/detection/entry_trigger.cpp
+    src/detection/entry_all_detector.cpp
     src/detection/glyph_ocr.cpp
     src/detection/trigger_roi_builder.cpp
     src/detection/text_parser.cpp
@@ -192,6 +193,7 @@ set(HEADER_FILES
     include/detection/panel_finder.h
     include/detection/symbol_matcher.h
     include/detection/entry_trigger.h
+    include/detection/entry_all_detector.h
     include/detection/glyph_ocr.h
     include/detection/trigger_roi_builder.h
     include/detection/text_parser.h
