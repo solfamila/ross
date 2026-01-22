@@ -14,16 +14,27 @@ struct EntryAllEvent {
 };
 
 struct EntryAllConfig {
-	int maxRows = 3;
-	int rowStride = 0; // 0 = auto (roiH / maxRows)
-	int bandH = 32;
-	int symbolX0 = 0;
-	int symbolX1 = 90;
-	double diffThreshold = 2.5;
-	float ocrThreshold = 0.50f;
-	bool debug = false;
-	int debugMax = 5;
+    int maxRows = 3;
+    // If rowStride==0, auto-detect row centers; otherwise fixed stride in pixels.
+    int rowStride = 0;
+    int bandH = 32;
+
+    // Symbol column inside ROI
+    int symbolX0 = 0;
+    int symbolX1 = 90;
+
+    // Optional body region inside ROI (relative Y). If bodyH<=0, uses full ROI.
+    int bodyOffsetY = 0;
+    int bodyH = -1;
+
+    // Change gate and OCR threshold
+    double diffThreshold = 2.5;
+    float ocrThreshold = 0.55f;
+
+    bool debug = false;
+    int debugMax = 5;
 };
+
 
 class EntryAllDetector {
 public:

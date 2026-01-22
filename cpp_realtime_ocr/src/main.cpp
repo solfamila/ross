@@ -1330,6 +1330,18 @@ int main(int argc, char* argv[]) {
         trading_monitor::detect::EntryAllConfig entryAllCfg;
         entryAllCfg.debug = verbose;
         entryAllCfg.debugMax = 6;
+        if (entryAllSymbolXOverride >= 0) {
+            entryAllCfg.symbolX0 = entryAllSymbolXOverride;
+        }
+        if (entryAllSymbolWOverride > 0) {
+            entryAllCfg.symbolX1 = entryAllCfg.symbolX0 + entryAllSymbolWOverride;
+        }
+        if (entryAllBodyYOffsetOverride >= 0) {
+            entryAllCfg.bodyOffsetY = entryAllBodyYOffsetOverride;
+        }
+        if (entryAllBodyHeightOverride > 0) {
+            entryAllCfg.bodyH = entryAllBodyHeightOverride;
+        }
         trading_monitor::detect::EntryAllDetector entryAll(entryAllCfg);
         trading_monitor::detect::TriggerRoiBuilder trigBuilder;
         trading_monitor::detect::TriggerRoiConfig trigCfg;
@@ -1409,26 +1421,8 @@ int main(int argc, char* argv[]) {
             entryAllPrevH.assign(entryAllMaxRows, 0);
             entryAllSeen.assign(entryAllMaxRows, false);
 
-            if (entryAllSvtr.loadModel(enginePath)) {
-                entryAllSvtr.getOutputDims(entryAllTimesteps, entryAllNumClasses);
-                if (entryAllDecoder.loadDictionary(dictPath)) {
-                    entryAllDecoder.ensurePaddleOCRDictionarySize(entryAllNumClasses);
-                }
-
-                const size_t inputElems = static_cast<size_t>(3) * 48 * 320;
-                entryAllHostInput.assign(inputElems, -1.0f);
-                entryAllHostOutput.resize(static_cast<size_t>(entryAllTimesteps) * static_cast<size_t>(entryAllNumClasses));
-
-                cudaStreamCreateWithFlags(&entryAllStream, cudaStreamNonBlocking);
-                cudaMalloc(&entryAllDeviceInput, inputElems * sizeof(float));
-
-                entryAllSvtrReady = (entryAllDeviceInput != nullptr);
-                if (!entryAllSvtrReady) {
-                    std::cerr << "WARNING: Failed to allocate SVTR input buffer for entry-all; falling back to glyph OCR.\n";
-                }
-            } else if (verbose) {
-                std::cerr << "WARNING: SVTR engine not available for entry-all; falling back to glyph OCR.\n";
-            }
+            // Skip SVTR/TensorRT OCR in entry-all video mode; use glyph OCR only.
+            entryAllSvtrReady = false;
         }
 
         histStartF = videoStartFrame;
